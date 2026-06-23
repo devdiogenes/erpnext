@@ -237,6 +237,7 @@ class POSInvoiceMergeLog(Document):
 				si_item = map_child_doc(item, invoice, {"doctype": "Sales Invoice Item"})
 				si_item.pos_invoice = doc.name
 				si_item.pos_invoice_item = item.name
+				si_item.pricing_rules = None
 				if doc.is_return:
 					si_item.sales_invoice_item = get_sales_invoice_item_from_consolidated_invoice(
 						doc.return_against, item.pos_invoice_item
