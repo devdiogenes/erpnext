@@ -47,9 +47,11 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 			callback: (r) => {
 				if (r.message) {
 					this.bank_transaction = r.message;
+					this.company = r.message.company;
 					r.message.payment_entry = 1;
 					r.message.journal_entry = 1;
 					this.dialog.set_values(r.message);
+					this.dialog.set_value("deductions", []);
 					this.copy_data_to_voucher();
 					this.dialog.show();
 				}
@@ -220,9 +222,21 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 				me.dialog = new frappe.ui.Dialog({
 					title: __("Reconcile the Bank Transaction"),
 					fields: fields,
-					size: "large",
+					size: "extra-large",
 					primary_action: (values) => this.reconciliation_dialog_primary_action(values),
 				});
+
+				me.dialog.wrapper.on(
+					"input.deductions_diff change.deductions_diff",
+					"[data-fieldname='deductions'] input, [data-fieldname='deductions'] select",
+					() => {
+						me._recalculate_unallocated();
+						const gw = me.dialog.fields_dict.invoices_grid?.$wrapper;
+						if (gw && me.invoices_datatable) {
+							me._update_invoice_footer(gw);
+						}
+					}
+				);
 			},
 		});
 	}
@@ -352,6 +366,10 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 						},
 					};
 				},
+				onchange: () => {
+					this.dialog.set_value("party", "");
+					this.load_invoices();
+				},
 			},
 			{
 				fieldname: "party",
@@ -360,6 +378,8 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 				options: "party_type",
 				mandatory_depends_on:
 					"eval:doc.action=='Create Voucher' && doc.document_type=='Payment Entry'",
+				onchange: () => this.load_invoices(),
+				default: 1,
 			},
 			{
 				fieldname: "bank_account",
@@ -397,6 +417,73 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 						},
 					};
 				},
+			},
+			{
+				fieldtype: "Section Break",
+				fieldname: "select_invoices_section",
+				label: __("Select Invoices"),
+				depends_on:
+					"eval:doc.action=='Create Voucher' && doc.document_type=='Payment Entry' && (doc.party_type=='Customer' || doc.party_type=='Supplier') && doc.party",
+			},
+			{
+				fieldtype: "Check",
+				fieldname: "based_on_payment_terms",
+				label: __("Based On Payment Terms"),
+				onchange: () => this.load_invoices(),
+			},
+			{
+				fieldtype: "HTML",
+				fieldname: "invoices_grid",
+			},
+			{
+				fieldtype: "Section Break",
+				fieldname: "deductions_section",
+				label: __("Outras Taxas / Deduções"),
+				depends_on: "eval:doc.action=='Create Voucher' && doc.document_type=='Payment Entry'",
+				collapsible: 1,
+				collapsed: 1,
+			},
+			{
+				fieldtype: "Table",
+				fieldname: "deductions",
+				label: __("Deductions"),
+				fields: [
+					{
+						fieldname: "account",
+						fieldtype: "Link",
+						label: __("Account"),
+						options: "Account",
+						in_list_view: 1,
+						reqd: 1,
+						get_query: () => ({
+							filters: {
+								is_group: 0,
+								company: this.company,
+							},
+						}),
+					},
+					{
+						fieldname: "cost_center",
+						fieldtype: "Link",
+						label: __("Cost Center"),
+						options: "Cost Center",
+						in_list_view: 1,
+						reqd: 1,
+						get_query: () => ({
+							filters: {
+								is_group: 0,
+								company: this.company,
+							},
+						}),
+					},
+					{
+						fieldname: "amount",
+						fieldtype: "Currency",
+						label: __("Amount"),
+						in_list_view: 1,
+						reqd: 1,
+					},
+				],
 			},
 			{
 				fieldtype: "Section Break",
@@ -527,6 +614,8 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 				project: values.project,
 				cost_center: values.cost_center,
 				company_bank_account: values?.bank_account || this?.bank_account,
+				invoices: this.get_selected_invoices(),
+				deductions: values.deductions,
 			},
 			callback: (response) => {
 				const alert_string = __("Bank Transaction {0} added as Payment Entry", [
@@ -582,6 +671,320 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 		});
 	}
 
+	load_invoices() {
+		const values = this.dialog.get_values(true);
+		const grid_wrapper = this.dialog.fields_dict.invoices_grid.$wrapper;
+
+		if (
+			!values.party_type ||
+			!values.party ||
+			(values.party_type !== "Customer" && values.party_type !== "Supplier")
+		) {
+			grid_wrapper.html("");
+			return;
+		}
+
+		const unallocated_amount = this.bank_transaction ? this.bank_transaction.unallocated_amount || 0 : 0;
+		frappe.call({
+			method: "erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_outstanding_invoices_for_reconciliation",
+			args: {
+				party_type: values.party_type,
+				party: values.party,
+				company: this.company,
+				based_on_payment_terms: cint(this.dialog.get_value("based_on_payment_terms")),
+				deposit: flt(this.bank_transaction.deposit),
+				withdrawal: flt(this.bank_transaction.withdrawal),
+				date: this.bank_transaction.date,
+			},
+			callback: (r) => {
+				if (!r.message) return;
+				const { invoices, invoice_doctype } = r.message;
+				this.render_invoices_grid(invoices, invoice_doctype, values.party, unallocated_amount);
+			},
+		});
+	}
+
+	render_invoices_grid(invoices, invoice_doctype, party, unallocated_amount) {
+		const grid_wrapper = this.dialog.fields_dict.invoices_grid.$wrapper;
+		const currency = invoices.length > 0 ? invoices[0].currency : frappe.boot.sysdefaults.currency;
+
+		this._invoices_data = invoices;
+		this._invoice_currency = currency;
+		this._base_unallocated_amount = unallocated_amount;
+		this._unallocated_amount = unallocated_amount;
+		this._invoices_allocations = {};
+		this._invoices_checked = {};
+
+		if (this.invoices_datatable) {
+			$(`.${this.invoices_datatable.style.scopeClass}`).off(".invoices_dt");
+			this.invoices_datatable = null;
+		}
+
+		if (!invoices.length) {
+			grid_wrapper.html(`
+				<div class="text-muted text-center" style="padding: 12px 0;">
+					${__("No outstanding invoices found for {0}", [party])}
+				</div>
+			`);
+			return;
+		}
+
+		const data = invoices.map((inv, idx) => [
+			__(inv.voucher_type || invoice_doctype),
+			inv.name,
+			inv.bill_no || "-",
+			frappe.datetime.str_to_user(inv.due_date) || "-",
+			format_currency(inv.grand_total, inv.currency),
+			format_currency(inv.outstanding_amount, inv.currency),
+			idx,
+		]);
+
+		grid_wrapper.html('<div class="invoices-dt-container"></div>');
+		grid_wrapper.append(`
+			<div class="invoice-footer-summary"
+				style="display:flex; justify-content:flex-end; gap:16px; align-items:center;
+					padding: 8px 4px; border-top: 1px solid var(--border-color); margin-top: 2px;">
+				<span>
+					<span class="text-muted small">${__("Allocated")}: </span>
+					<strong class="invoice-footer-allocated small">${format_currency(0, currency)}</strong>
+				</span>
+				<span>
+					<span class="text-muted small">${__("Unallocated")}: </span>
+					<strong class="invoice-footer-unallocated small" style="color: var(--blue-700);">
+						${format_currency(unallocated_amount, currency)}
+					</strong>
+				</span>
+			</div>
+		`);
+
+		this.invoices_datatable = new frappe.DataTable(grid_wrapper.find(".invoices-dt-container").get(0), {
+			columns: this._get_invoice_dt_columns(),
+			data: data,
+			dynamicRowHeight: true,
+			checkboxColumn: true,
+			inlineFilters: true,
+		});
+
+		this._set_invoice_dt_listeners(grid_wrapper);
+	}
+
+	_get_invoice_dt_columns() {
+		return [
+			{
+				name: "document_type",
+				id: "document_type",
+				content: `${__("Document Type")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "left",
+				width: 125,
+			},
+			{
+				name: "document_name",
+				id: "document_name",
+				content: `${__("Document Name")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "left",
+				width: 180,
+				format: (value, row) => {
+					// row[2] = first data column (Document Type), offset +2 for Sr.No and Checkbox prepended by DataTable internally
+					return frappe.form.formatters.Link(value, { options: row[2].content });
+				},
+			},
+			{
+				name: "invoice_no",
+				id: "invoice_no",
+				content: `${__("Invoice No")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "left",
+				width: 120,
+			},
+			{
+				name: "due_date",
+				id: "due_date",
+				content: `${__("Due Date")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "left",
+				width: 120,
+				format: (value, row) => {
+					// row[8] = data[6] = idx (offset +2: Sr.No + Checkbox)
+					const priority = this._invoices_data?.[row[8].content]?.priority;
+					return priority === 0 || priority === 2
+						? `<span style="color:var(--green-500)">${value}</span>`
+						: value;
+				},
+			},
+			{
+				name: "grand_total",
+				id: "grand_total",
+				content: `${__("Grand Total")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "right",
+				width: 120,
+			},
+			{
+				name: "outstanding_amount",
+				id: "outstanding_amount",
+				content: `${__("Outstanding")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				align: "right",
+				width: 120,
+				format: (value, row) => {
+					// row[8] = data[6] = idx (offset +2: Sr.No + Checkbox)
+					const priority = this._invoices_data?.[row[8].content]?.priority;
+					return priority === 0 || priority === 1
+						? `<span style="color:var(--green-500)">${value}</span>`
+						: value;
+				},
+			},
+			{
+				name: "allocated_amount",
+				id: "allocated_amount",
+				content: `${__("Allocated")}`,
+				editable: false,
+				focusable: false,
+				dropdown: false,
+				sortable: false,
+				align: "right",
+				width: 120,
+				format: (value) => {
+					const idx = value;
+					const alloc = this._invoices_allocations[idx] || 0;
+					const checked = this._invoices_checked[idx] || false;
+					return `<input type="number" class="allocated-amount form-control form-control-sm"
+						data-index="${idx}" value="${alloc > 0 ? flt(alloc, 2) : 0}"
+						min="0" style="text-align:right;" ${!checked ? "disabled" : ""}>`;
+				},
+			},
+		];
+	}
+
+	_set_invoice_dt_listeners(grid_wrapper) {
+		const scope = `.${this.invoices_datatable.style.scopeClass}`;
+
+		$(scope).on("click.invoices_dt", "input[type='checkbox']", () => {
+			setTimeout(() => this._sync_invoice_check_state(grid_wrapper), 0);
+		});
+
+		$(scope).on("input.invoices_dt", ".allocated-amount", () => {
+			this._update_invoice_footer(grid_wrapper);
+		});
+
+		$(scope).on("blur.invoices_dt", ".allocated-amount", (e) => {
+			const $input = $(e.target);
+			const idx = parseInt($input.data("index"));
+			const val = Math.max(parseFloat($input.val()) || 0, 0);
+			$input.val(flt(val, 2));
+			if (idx >= 0) this._invoices_allocations[idx] = val;
+			this._update_invoice_footer(grid_wrapper);
+		});
+	}
+
+	_sync_invoice_check_state(grid_wrapper) {
+		if (!this.invoices_datatable) return;
+		const checkMap = this.invoices_datatable.rowmanager.checkMap;
+		checkMap.forEach((val, index) => {
+			const checked = val == 1;
+			const was_checked = this._invoices_checked[index] || false;
+
+			if (checked && !was_checked) {
+				const alloc = this._auto_alloc_dt(index, grid_wrapper);
+				this._invoices_allocations[index] = alloc;
+				this._invoices_checked[index] = true;
+				grid_wrapper
+					.find(`.allocated-amount[data-index="${index}"]`)
+					.val(alloc > 0 ? flt(alloc, 2) : 0)
+					.prop("disabled", false);
+			} else if (!checked && was_checked) {
+				this._invoices_allocations[index] = 0;
+				this._invoices_checked[index] = false;
+				grid_wrapper.find(`.allocated-amount[data-index="${index}"]`).val(0).prop("disabled", true);
+			}
+		});
+		this._update_invoice_footer(grid_wrapper);
+	}
+
+	_auto_alloc_dt(idx, grid_wrapper) {
+		const outstanding = this._invoices_data[idx]?.outstanding_amount || 0;
+		const checkMap = this.invoices_datatable.rowmanager.checkMap;
+		let already_allocated = 0;
+		checkMap.forEach((val, other_idx) => {
+			if (val == 1 && other_idx !== idx) {
+				const $inp = grid_wrapper.find(`.allocated-amount[data-index="${other_idx}"]`);
+				already_allocated += $inp.length
+					? parseFloat($inp.val()) || 0
+					: this._invoices_allocations[other_idx] || 0;
+			}
+		});
+		const remaining = (this._unallocated_amount || 0) - already_allocated;
+		return Math.min(outstanding, Math.max(0, remaining));
+	}
+
+	_update_invoice_footer(grid_wrapper) {
+		if (!this.invoices_datatable) return;
+		const checkMap = this.invoices_datatable.rowmanager.checkMap;
+		let total_allocated = 0;
+		checkMap.forEach((val, index) => {
+			if (val == 1) {
+				const $input = grid_wrapper.find(`.allocated-amount[data-index="${index}"]`);
+				total_allocated += $input.length
+					? parseFloat($input.val()) || 0
+					: this._invoices_allocations[index] || 0;
+			}
+		});
+		const unallocated = (this._unallocated_amount || 0) - total_allocated;
+		const currency = this._invoice_currency;
+		grid_wrapper.find(".invoice-footer-allocated").text(format_currency(total_allocated, currency));
+		const $unalloc = grid_wrapper.find(".invoice-footer-unallocated");
+		const color =
+			unallocated < 0 ? "var(--red-500)" : unallocated === 0 ? "var(--green-500)" : "var(--blue-700)";
+		$unalloc.text(format_currency(unallocated, currency)).css("color", color);
+	}
+
+	_get_total_deductions() {
+		const rows = this.dialog.get_value("deductions") || [];
+		return rows.reduce((sum, row) => sum + flt(row.amount || 0), 0);
+	}
+
+	_recalculate_unallocated() {
+		const bt = this.bank_transaction;
+		if (!bt) return;
+		const base = this._base_unallocated_amount || 0;
+		const total_deductions = this._get_total_deductions();
+		const is_receive = flt(bt.deposit || 0) > 0;
+		this._unallocated_amount = Math.max(
+			0,
+			is_receive ? base + total_deductions : base - total_deductions
+		);
+	}
+
+	get_selected_invoices() {
+		if (!this._invoices_data || !this.invoices_datatable) return [];
+		const checkMap = this.invoices_datatable.rowmanager.checkMap;
+		const grid_wrapper = this.dialog.fields_dict.invoices_grid.$wrapper;
+		return checkMap.reduce((selected, val, index) => {
+			if (val == 1 && this._invoices_data[index]) {
+				const $input = grid_wrapper.find(`.allocated-amount[data-index="${index}"]`);
+				const allocated_amount = $input.length
+					? parseFloat($input.val()) || 0
+					: this._invoices_allocations[index] || 0;
+				selected.push({ ...this._invoices_data[index], allocated_amount });
+			}
+			return selected;
+		}, []);
+	}
+
 	edit_in_full_page() {
 		const values = this.dialog.get_values(true);
 		if (values.document_type == "Payment Entry") {
@@ -597,6 +1000,8 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 					mode_of_payment: values.mode_of_payment,
 					project: values.project,
 					cost_center: values.cost_center,
+					invoices: this.get_selected_invoices(),
+					deductions: values.deductions,
 					allow_edit: true,
 					company_bank_account: values?.bank_account || this?.bank_account,
 				},

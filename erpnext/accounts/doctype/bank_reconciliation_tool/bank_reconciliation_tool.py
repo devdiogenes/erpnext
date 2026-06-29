@@ -318,7 +318,14 @@ def create_payment_entry_bts(
 	cost_center: str | None = None,
 	allow_edit: bool | None = None,
 	company_bank_account: str | None = None,
+	invoices: list | str | None = None,
+	deductions: list | str | None = None,
 ):
+	if isinstance(invoices, str):
+		invoices = json.loads(invoices)
+	if isinstance(deductions, str):
+		deductions = json.loads(deductions)
+
 	# Create a new payment entry based on the bank transaction
 	bank_transaction = frappe.db.get_values(
 		"Bank Transaction",
@@ -361,6 +368,39 @@ def create_payment_entry_bts(
 
 	if company_bank_account:
 		pe.bank_account = company_bank_account
+
+	if invoices:
+		for inv in invoices:
+			allocated = flt(inv.get("allocated_amount"))
+			if not allocated:
+				continue
+			pe.append(
+				"references",
+				{
+					"reference_doctype": inv.get("voucher_type")
+					or ("Sales Invoice" if party_type == "Customer" else "Purchase Invoice"),
+					"reference_name": inv.get("name"),
+					"due_date": inv.get("due_date"),
+					"bill_no": inv.get("bill_no"),
+					"payment_term": inv.get("_payment_term"),
+					"outstanding_amount": inv.get("outstanding_amount"),
+					"allocated_amount": allocated,
+				},
+			)
+
+	if deductions:
+		for row in deductions:
+			if not row.get("account"):
+				continue
+			pe.append(
+				"deductions",
+				{
+					"account": row.get("account"),
+					"cost_center": row.get("cost_center"),
+					"amount": flt(row.get("amount")),
+					"description": row.get("description"),
+				},
+			)
 
 	pe.validate()
 
@@ -954,6 +994,215 @@ def search_for_transfer_transaction(transaction_id: str | int):
 		}
 
 	return None
+
+
+@frappe.whitelist()
+def get_outstanding_invoices_for_reconciliation(
+	party_type: str,
+	party: str,
+	company: str,
+	based_on_payment_terms: int = 0,
+	deposit: float = 0,
+	withdrawal: float = 0,
+	date: str | date | None = None,
+):
+	from erpnext.accounts.doctype.payment_entry.payment_entry import (
+		get_outstanding_reference_documents,
+	)
+	from erpnext.accounts.party import get_party_account
+
+	based_on_payment_terms = cint(based_on_payment_terms)
+	invoice_doctype = "Sales Invoice" if party_type == "Customer" else "Purchase Invoice"
+
+	party_account = get_party_account(party_type, party, company)
+	args = frappe._dict(
+		{
+			"party_type": party_type,
+			"party": party,
+			"party_account": party_account,
+			"company": company,
+			"get_outstanding_invoices": True,
+			"get_orders_to_be_billed": False,
+		}
+	)
+
+	data = get_outstanding_reference_documents(args) or []
+
+	if based_on_payment_terms:
+		data = split_invoices_based_on_payment_terms(data, invoice_doctype)
+
+	invoices = _map_to_invoice_list(data)
+
+	reference_amount = flt(deposit) if party_type == "Customer" else flt(withdrawal)
+	invoices = _sort_invoices_by_match(invoices, reference_amount, date)
+
+	return {"invoices": invoices, "invoice_doctype": invoice_doctype}
+
+
+def split_invoices_based_on_payment_terms(data, invoice_doctype):
+	"""
+	Replaces invoices that have a Payment Schedule with their individual installments.
+	Documents without installments (Journal Entries, invoices without PS) are returned unchanged.
+	Returns data in the same format as get_outstanding_reference_documents.
+	"""
+	invoice_names = [d.get("voucher_no") for d in data if d.get("voucher_type") == invoice_doctype]
+	if not invoice_names:
+		return data
+
+	inv = frappe.qb.DocType(invoice_doctype)
+	ps = frappe.qb.DocType("Payment Schedule")
+	ps_rows = (
+		frappe.qb.from_(inv)
+		.join(ps)
+		.on((ps.parent == inv.name) & (ps.parenttype == invoice_doctype))
+		.select(
+			inv.name,
+			inv.bill_no,
+			inv.currency,
+			inv.grand_total,
+			inv.total_advance,
+			inv.outstanding_amount.as_("invoice_outstanding"),
+			ps.due_date,
+			ps.payment_amount,
+			ps.paid_amount,
+			ps.discounted_amount,
+			ps.payment_term.as_("_payment_term"),
+		)
+		.where(inv.name.isin(invoice_names))
+		.orderby(inv.name)
+		.orderby(ps.due_date)
+	).run(as_dict=True)
+
+	if not ps_rows:
+		return data
+
+	data_by_voucher = {d.get("voucher_no"): d for d in data}
+	invoices_with_ps = {r.name for r in ps_rows}
+
+	result = []
+	for inst in _calculate_installment_outstanding(ps_rows):
+		original = data_by_voucher.get(inst.name, frappe._dict())
+		result.append(
+			frappe._dict(
+				{
+					"due_date": inst.due_date,
+					"currency": inst.currency,
+					"voucher_no": inst.name,
+					"voucher_type": invoice_doctype,
+					"posting_date": original.get("posting_date"),
+					"invoice_amount": original.get("invoice_amount"),
+					"outstanding_amount": inst.outstanding_amount,
+					"payment_term_outstanding": inst.outstanding_amount,
+					"payment_amount": inst.grand_total,
+					"payment_term": inst.get("_payment_term"),
+				}
+			)
+		)
+
+	result += [d for d in data if d.get("voucher_no") not in invoices_with_ps]
+	return result
+
+
+def _map_to_invoice_list(data):
+	return [
+		frappe._dict(
+			{
+				"name": d.get("voucher_no"),
+				"voucher_type": d.get("voucher_type"),
+				"bill_no": d.get("bill_no"),
+				"currency": d.get("currency"),
+				"due_date": d.get("due_date"),
+				"grand_total": d.get("invoice_amount"),
+				"outstanding_amount": d.get("outstanding_amount"),
+				"_payment_term": d.get("payment_term"),
+			}
+		)
+		for d in data
+	]
+
+
+def _sort_invoices_by_match(invoices, reference_amount, date):
+	"""
+	Sorts invoices/installments by priority:
+	  0 - amount AND date match
+	  1 - amount only matches
+	  2 - date only matches
+	  3 - no match (keeps original order by due_date)
+	"""
+	ref_str = str(date) if date else None
+
+	def get_priority(inv):
+		amount_match = reference_amount > 0 and flt(inv.get("outstanding_amount"), 2) == flt(
+			reference_amount, 2
+		)
+		date_match = ref_str and str(inv.get("due_date") or "") == ref_str
+		if amount_match and date_match:
+			return 0
+		if amount_match:
+			return 1
+		if date_match:
+			return 2
+		return 3
+
+	for inv in invoices:
+		inv["priority"] = get_priority(inv)
+
+	return sorted(invoices, key=lambda inv: inv["priority"])
+
+
+def _calculate_installment_outstanding(rows):
+	"""
+	Mirrors the logic from accounts_receivable.py:
+	  1. Per installment: outstanding = payment_amount - ps.paid_amount - ps.discounted_amount
+	  2. Unallocated payments (total_paid - total_advance - sum_ps_paid) are distributed
+	     to the earliest installments (equivalent to allocate_closing_to_term).
+	  3. total_advance is excluded from distribution because it reduces the invoice-level
+	     outstanding, not individual installment outstanding.
+	"""
+	from collections import defaultdict
+
+	invoice_rows = defaultdict(list)
+	for row in rows:
+		invoice_rows[row.name].append(row)
+
+	result = []
+	for _invoice_name, installments in invoice_rows.items():
+		installments.sort(key=lambda x: x.due_date or "")
+
+		first = installments[0]
+		total_paid = flt(first.grand_total) - flt(first.invoice_outstanding)
+		total_advance = flt(first.total_advance)
+		sum_paid_in_terms = sum(flt(i.paid_amount) + flt(i.discounted_amount) for i in installments)
+
+		unallocated = max(total_paid - total_advance - sum_paid_in_terms, 0)
+
+		for inst in installments:
+			outstanding = flt(inst.payment_amount) - flt(inst.paid_amount) - flt(inst.discounted_amount)
+
+			if unallocated > 0 and outstanding > 0:
+				applied = min(unallocated, outstanding)
+				outstanding -= applied
+				unallocated -= applied
+
+			if outstanding <= 0:
+				continue
+
+			result.append(
+				frappe._dict(
+					{
+						"name": inst.name,
+						"bill_no": inst.bill_no,
+						"currency": inst.currency,
+						"due_date": inst.due_date,
+						"grand_total": inst.payment_amount,
+						"outstanding_amount": outstanding,
+						"_payment_term": inst.get("_payment_term"),
+					}
+				)
+			)
+
+	result.sort(key=lambda x: x.due_date or "")
+	return result
 
 
 @frappe.whitelist()

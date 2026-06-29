@@ -193,6 +193,13 @@
    "set_only_once": 1
   },
   {
+   "fieldname": "payload_count",
+   "fieldtype": "Int",
+   "hidden": 1,
+   "label": "Payload Count",
+   "read_only": 1
+  },
+  {
    "fieldname": "column_break_4",
    "fieldtype": "Column Break"
   },
