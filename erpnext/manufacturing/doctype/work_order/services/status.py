@@ -10,7 +10,7 @@ callers (job cards, sales orders, production plans, patches) keep working.
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import Sum
+from frappe.query_builder.functions import IfNull, Sum
 from frappe.utils import cint, flt, get_link_to_form
 
 from erpnext.stock.stock_balance import get_planned_qty, update_bin_qty
@@ -87,6 +87,12 @@ class StatusService:
 
 	def update_status(self, status=None):
 		"""Update status of work order if unknown"""
+		if self.doc.docstatus == 1:
+			# Refresh material_transferred_for_manufacturing before deciding status so pick-list-
+			# driven transfers (where this qty is derived from item transfers, not fg_completed_qty)
+			# are reflected immediately, instead of only after the next status update call.
+			self.doc.refresh_material_transferred_for_manufacturing()
+
 		if self.doc.status != "Closed":
 			if status not in ["Stopped", "Closed"]:
 				status = self.get_status(status)
@@ -126,7 +132,7 @@ class StatusService:
 
 		status = (
 			"In Process"
-			if flt(self.doc.material_transferred_for_manufacturing) > 0 or self.doc.skip_transfer
+			if flt(self.doc.material_transferred_for_manufacturing) > 0 or self._has_transferred_material()
 			else "Not Started"
 		)
 		precision = frappe.get_precision("Work Order", "produced_qty")
@@ -134,6 +140,24 @@ class StatusService:
 		if flt(total_qty, precision) >= flt(self.doc.qty, precision):
 			status = "Completed"
 		return status
+
+	def _has_transferred_material(self):
+		"""True if any raw material was transferred against this work order."""
+		ste = frappe.qb.DocType("Stock Entry")
+		ste_child = frappe.qb.DocType("Stock Entry Detail")
+		qty = (
+			frappe.qb.from_(ste)
+			.inner_join(ste_child)
+			.on(ste_child.parent == ste.name)
+			.select(Sum(ste_child.transfer_qty))
+			.where(
+				(ste.work_order == self.doc.name)
+				& (ste.docstatus == 1)
+				& (ste.purpose == "Material Transfer for Manufacture")
+				& (ste.is_return == 0)
+			)
+		).run()[0][0]
+		return flt(qty) > 0
 
 	def _is_partial_skip_transfer(self):
 		return bool(
@@ -241,7 +265,13 @@ class StatusService:
 				.where(child.is_finished_item == 1)
 			)
 		else:
-			query = query.select(Sum(parent.fg_completed_qty))
+			job_card = frappe.qb.DocType("Job Card")
+			query = (
+				query.left_join(job_card)
+				.on(parent.job_card == job_card.name)
+				.where(IfNull(job_card.is_corrective_job_card, 0) == 0)
+				.select(Sum(parent.fg_completed_qty))
+			)
 
 		return flt(query.run()[0][0])
 
@@ -254,6 +284,12 @@ class StatusService:
 		)
 
 	def set_process_loss_qty(self):
+		self.doc.db_set("process_loss_qty", self._process_loss_qty())
+
+	def _process_loss_qty(self):
+		if self.doc.track_semi_finished_goods:
+			return flt(sum(flt(row.process_loss_qty) for row in self.doc.operations))
+
 		table = frappe.qb.DocType("Stock Entry")
 		process_loss_qty = (
 			frappe.qb.from_(table)
@@ -265,7 +301,7 @@ class StatusService:
 			)
 		).run()[0][0]
 
-		self.doc.db_set("process_loss_qty", flt(process_loss_qty))
+		return flt(process_loss_qty)
 
 	def update_production_plan_status(self):
 		production_plan = frappe.get_doc("Production Plan", self.doc.production_plan)

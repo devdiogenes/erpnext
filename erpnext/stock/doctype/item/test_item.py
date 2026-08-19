@@ -25,7 +25,7 @@ from erpnext.stock.doctype.item.item import (
 	validate_is_stock_item,
 )
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
-from erpnext.stock.get_item_details import ItemDetailsCtx, get_item_details
+from erpnext.stock.get_item_details import get_item_details
 from erpnext.tests.utils import ERPNextTestSuite
 
 
@@ -69,6 +69,20 @@ def make_item(item_code=None, properties=None, uoms=None, barcode=None):
 	item.insert()
 
 	return item
+
+
+def make_uom_conversion_factor(from_uom, to_uom, value, category="Mass"):
+	for uom in (from_uom, to_uom):
+		if not frappe.db.exists("UOM", uom):
+			frappe.get_doc(doctype="UOM", uom_name=uom, category=category).insert()
+
+	return frappe.get_doc(
+		doctype="UOM Conversion Factor",
+		category=category,
+		from_uom=from_uom,
+		to_uom=to_uom,
+		value=value,
+	).insert()
 
 
 class TestItem(ERPNextTestSuite):
@@ -158,7 +172,7 @@ class TestItem(ERPNextTestSuite):
 		currency = frappe.get_cached_value("Company", company, "default_currency")
 
 		details = get_item_details(
-			ItemDetailsCtx(
+			frappe._dict(
 				{
 					"item_code": "_Test Item",
 					"company": company,
@@ -188,7 +202,7 @@ class TestItem(ERPNextTestSuite):
 		create_fixed_asset_item()
 
 		details = get_item_details(
-			ItemDetailsCtx(
+			frappe._dict(
 				{
 					"item_code": "Macbook Pro",
 					"company": "_Test Company",
@@ -201,7 +215,7 @@ class TestItem(ERPNextTestSuite):
 
 		frappe.db.set_value("Asset Category", "Computers", "enable_cwip_accounting", "1")
 		details = get_item_details(
-			ItemDetailsCtx(
+			frappe._dict(
 				{
 					"item_code": "Macbook Pro",
 					"company": "_Test Company",
@@ -291,7 +305,7 @@ class TestItem(ERPNextTestSuite):
 
 		for data in expected_item_tax_template:
 			details = get_item_details(
-				ItemDetailsCtx(
+				frappe._dict(
 					{
 						"item_code": data["item_code"],
 						"tax_category": data["tax_category"],
@@ -343,7 +357,7 @@ class TestItem(ERPNextTestSuite):
 			"cost_center": "_Test Cost Center 2 - _TC",  # from item group
 		}
 		sales_item_details = get_item_details(
-			ItemDetailsCtx(
+			frappe._dict(
 				{
 					"item_code": "Test Item With Defaults",
 					"company": "_Test Company",
@@ -368,7 +382,7 @@ class TestItem(ERPNextTestSuite):
 			"cost_center": "_Test Write Off Cost Center - _TC",  # from item
 		}
 		purchase_item_details = get_item_details(
-			ItemDetailsCtx(
+			frappe._dict(
 				{
 					"item_code": "Test Item With Defaults",
 					"company": "_Test Company",
@@ -422,6 +436,45 @@ class TestItem(ERPNextTestSuite):
 		frappe.flags.attribute_values = None
 
 		self.assertRaises(InvalidItemAttributeValueError, attribute.save)
+
+	def test_disabled_attribute_blocks_only_attribute_changes(self):
+		frappe.delete_doc_if_exists("Item", "_Test Disabled Attribute Template-L", force=1)
+		frappe.delete_doc_if_exists("Item", "_Test Disabled Attribute Template", force=1)
+		frappe.delete_doc_if_exists("Item Attribute", "_Test Disabled Size", force=1)
+
+		attribute = frappe.get_doc(
+			{
+				"doctype": "Item Attribute",
+				"attribute_name": "_Test Disabled Size",
+				"item_attribute_values": [
+					{"attribute_value": "Large", "abbr": "L"},
+					{"attribute_value": "Small", "abbr": "S"},
+				],
+			}
+		).insert()
+
+		template = make_item(
+			"_Test Disabled Attribute Template",
+			{
+				"has_variants": 1,
+				"variant_based_on": "Item Attribute",
+				"attributes": [{"attribute": attribute.name}],
+			},
+		)
+
+		variant = create_variant(template.name, {attribute.name: "Large"})
+		variant.save()
+
+		attribute.disabled = 1
+		attribute.save()
+
+		variant.reload()
+		variant.description = "Edited after the attribute was disabled"
+		variant.save()
+
+		variant.reload()
+		variant.attributes[0].attribute_value = "Small"
+		self.assertRaises(frappe.ValidationError, variant.save)
 
 	def test_rename_attribute_value_updates_variants(self):
 		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
@@ -504,6 +557,100 @@ class TestItem(ERPNextTestSuite):
 				"attribute_value",
 			),
 			"Large",
+		)
+
+	def test_rename_attribute_abbr_updates_variant_item_code(self):
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-LRG", force=1)
+
+		variant = create_variant("_Test Variant Item", {"Test Size": "Large"})
+		variant.save()
+
+		attribute = frappe.get_doc("Item Attribute", "Test Size")
+		for row in attribute.item_attribute_values:
+			if row.attribute_value == "Large":
+				row.abbr = "LRG"
+				break
+
+		def restore_test_size_abbr():
+			doc = frappe.get_doc("Item Attribute", "Test Size")
+			for row in doc.item_attribute_values:
+				if row.attribute_value == "Large":
+					row.abbr = "L"
+					break
+			frappe.flags.attribute_values = None
+			doc.save()
+
+		self.addCleanup(restore_test_size_abbr)
+		self.addCleanup(lambda: frappe.delete_doc_if_exists("Item", "_Test Variant Item-LRG", force=1))
+
+		frappe.flags.attribute_values = None
+		attribute.save()
+
+		self.assertFalse(frappe.db.exists("Item", "_Test Variant Item-L"))
+		self.assertTrue(frappe.db.exists("Item", "_Test Variant Item-LRG"))
+		self.assertEqual(
+			frappe.db.get_value("Item", "_Test Variant Item-LRG", "item_name"),
+			"_Test Variant Item-LRG",
+		)
+
+	def test_rename_attribute_abbr_updates_variant_item_name_from_template_name(self):
+		# item_name can be derived from the template's item_name, which may differ from its
+		# item_code (e.g. a friendly display name vs. a SKU-style code). The variant's item_name
+		# must follow the abbreviation rename the same way item_code does.
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item Diff-L", force=1)
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item Diff-LRG", force=1)
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item Diff", force=1)
+
+		template = frappe.get_doc("Item", "_Test Variant Item").as_dict()
+		template = frappe.get_doc(
+			{
+				"doctype": "Item",
+				"item_code": "_Test Variant Item Diff",
+				"item_name": "Test Variant Friendly Name",
+				"item_group": template.item_group,
+				"stock_uom": template.stock_uom,
+				"has_variants": 1,
+				"attributes": [{"attribute": "Test Size"}],
+			}
+		)
+		template.insert()
+		self.addCleanup(lambda: frappe.delete_doc_if_exists("Item", "_Test Variant Item Diff", force=1))
+
+		variant = create_variant("_Test Variant Item Diff", {"Test Size": "Large"})
+		variant.save()
+		self.assertEqual(variant.item_code, "_Test Variant Item Diff-L")
+		self.assertEqual(variant.item_name, "Test Variant Friendly Name-L")
+
+		# even a manually customized item_name (unrelated to the auto-generated pattern) must be
+		# rebuilt on abbreviation rename, since item_code and item_name are meant to stay in lockstep.
+		frappe.db.set_value("Item", variant.name, "item_name", "Custom Friendly Large Shirt Name")
+
+		attribute = frappe.get_doc("Item Attribute", "Test Size")
+		for row in attribute.item_attribute_values:
+			if row.attribute_value == "Large":
+				row.abbr = "LRG"
+				break
+
+		def restore_test_size_abbr():
+			doc = frappe.get_doc("Item Attribute", "Test Size")
+			for row in doc.item_attribute_values:
+				if row.attribute_value == "Large":
+					row.abbr = "L"
+					break
+			frappe.flags.attribute_values = None
+			doc.save()
+
+		self.addCleanup(restore_test_size_abbr)
+		self.addCleanup(lambda: frappe.delete_doc_if_exists("Item", "_Test Variant Item Diff-LRG", force=1))
+
+		frappe.flags.attribute_values = None
+		attribute.save()
+
+		self.assertFalse(frappe.db.exists("Item", "_Test Variant Item Diff-L"))
+		self.assertEqual(
+			frappe.db.get_value("Item", "_Test Variant Item Diff-LRG", "item_name"),
+			"Test Variant Friendly Name-LRG",
 		)
 
 	def test_make_item_variant(self):
@@ -651,18 +798,54 @@ class TestItem(ERPNextTestSuite):
 			"Test Item UOM", {"stock_uom": "Gram", "uoms": [dict(uom="Carat"), dict(uom="Kg")]}
 		)
 
-		for d in item_doc.uoms:
-			value = get_uom_conv_factor(d.uom, item_doc.stock_uom)
-			d.conversion_factor = value
-
 		self.assertEqual(item_doc.uoms[0].uom, "Carat")
 		self.assertEqual(item_doc.uoms[0].conversion_factor, 0.2)
 		self.assertEqual(item_doc.uoms[1].uom, "Kg")
 		self.assertEqual(item_doc.uoms[1].conversion_factor, 1000)
 
+	def test_item_uom_conversion_factor_overrides_global_factor(self):
+		custom_factor = 10.76
+		global_factor = get_uom_conv_factor("Square Meter", "Square Foot")
+		self.assertNotEqual(custom_factor, global_factor)
+
+		item = make_item(
+			properties={"stock_uom": "Square Foot"},
+			uoms=[{"uom": "Square Meter", "conversion_factor": custom_factor}],
+		)
+		item.reload()
+
+		conversion_factor = next(row.conversion_factor for row in item.uoms if row.uom == "Square Meter")
+		self.assertEqual(conversion_factor, custom_factor)
+
 	def test_uom_conv_intermediate(self):
 		factor = get_uom_conv_factor("Pound", "Gram")
 		self.assertAlmostEqual(factor, 453.592, 3)
+
+	def test_uom_conv_intermediate_with_shared_target(self):
+		make_uom_conversion_factor("_Test 3 Kg Bag", "Kg", 3)
+		make_uom_conversion_factor("_Test 25 Kg Bag", "Kg", 25)
+
+		factor = get_uom_conv_factor("_Test 3 Kg Bag", "_Test 25 Kg Bag")
+
+		self.assertEqual(factor, 0.12)
+
+	def test_uom_conv_intermediate_with_shared_target_is_deterministic(self):
+		make_uom_conversion_factor("_Test 3 Kg Bag", "Kg", 3)
+		make_uom_conversion_factor("_Test 25 Kg Bag", "Kg", 25)
+		make_uom_conversion_factor("_Test 3 Kg Bag", "Kg", 6)
+		make_uom_conversion_factor("_Test 25 Kg Bag", "Kg", 20)
+
+		factor = get_uom_conv_factor("_Test 3 Kg Bag", "_Test 25 Kg Bag")
+
+		self.assertEqual(factor, 0.12)
+
+	def test_uom_conv_intermediate_with_shared_target_ignores_zero_divisor(self):
+		make_uom_conversion_factor("_Test 3 Kg Bag", "Kg", 3)
+		make_uom_conversion_factor("_Test 25 Kg Bag", "Kg", 0)
+
+		factor = get_uom_conv_factor("_Test 3 Kg Bag", "_Test 25 Kg Bag")
+
+		self.assertIsNone(factor)
 
 	def test_uom_conv_base_case(self):
 		factor = get_uom_conv_factor("m", "m")
@@ -841,7 +1024,10 @@ class TestItem(ERPNextTestSuite):
 		item.reload()
 		item.stock_uom = "Nos"
 		item.save()
-		self.assertEqual(len(item.uoms), 1)
+		self.assertEqual(
+			[(row.uom, row.conversion_factor) for row in item.uoms],
+			[("Nos", 1)],
+		)
 
 	def test_validate_stock_item(self):
 		self.assertRaises(frappe.ValidationError, validate_is_stock_item, "_Test Non Stock Item")
@@ -882,10 +1068,8 @@ class TestItem(ERPNextTestSuite):
 		)
 		self.consume_item_code_with_differet_stock_transactions(item_code=item.name)
 
-	@ERPNextTestSuite.change_settings(
-		"Stock Settings", {"sample_retention_warehouse": "_Test Warehouse - _TC"}
-	)
 	def test_retain_sample(self):
+		frappe.db.set_value("Company", "_Test Company", "sample_retention_warehouse", "_Test Warehouse - _TC")
 		item = make_item("_TestRetainSample", {"has_batch_no": 1, "retain_sample": 1, "sample_quantity": 1})
 
 		self.assertEqual(item.has_batch_no, 1)
@@ -1119,6 +1303,47 @@ class TestItem(ERPNextTestSuite):
 
 			sabb_qty = frappe.db.get_value("Serial and Batch Bundle", serial_and_batch_bundle, "total_qty")
 			self.assertEqual(abs(sabb_qty), properties["opening_stock"])
+
+	def test_cannot_unset_serialized_while_bundle_exists(self):
+		from erpnext.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle import (
+			make_serial_batch_bundle,
+		)
+
+		item = make_item(
+			properties={"has_serial_no": 1, "is_stock_item": 1, "serial_no_series": "TSN-UNSET-.####"}
+		).name
+
+		serial_no = f"{item}-SN-01"
+		frappe.get_doc(
+			{"doctype": "Serial No", "serial_no": serial_no, "item_code": item, "company": "_Test Company"}
+		).insert()
+
+		# A draft (unsubmitted) Serial and Batch Bundle for the item must block the change.
+		bundle = make_serial_batch_bundle(
+			{
+				"item_code": item,
+				"warehouse": "_Test Warehouse - _TC",
+				"company": "_Test Company",
+				"qty": 1,
+				"rate": 100,
+				"voucher_type": "Stock Entry",
+				"serial_nos": [serial_no],
+				"type_of_transaction": "Inward",
+				"do_not_submit": True,
+				"ignore_sabb_validation": True,
+			}
+		)
+
+		doc = frappe.get_doc("Item", item)
+		doc.has_serial_no = 0
+		self.assertRaises(frappe.ValidationError, doc.save)
+
+		# Once the bundle is removed, the item can be made non-serialized.
+		frappe.delete_doc("Serial and Batch Bundle", bundle.name, force=True)
+		doc = frappe.get_doc("Item", item)
+		doc.has_serial_no = 0
+		doc.save()
+		self.assertEqual(frappe.db.get_value("Item", item, "has_serial_no"), 0)
 
 
 def set_item_variant_settings(fields):

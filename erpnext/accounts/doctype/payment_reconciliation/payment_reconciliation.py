@@ -18,6 +18,7 @@ from erpnext.accounts.doctype.process_payment_reconciliation.process_payment_rec
 	is_any_doc_running,
 )
 from erpnext.accounts.services.advances import get_advance_payment_entries_for_regional
+from erpnext.accounts.services.exchange_gain_loss import get_exchange_gain_loss_account
 from erpnext.accounts.utils import (
 	QueryPaymentLedger,
 	create_gain_loss_journal,
@@ -75,7 +76,10 @@ class PaymentReconciliation(Document):
 		self.accounting_dimension_filter_conditions = []
 		self.ple_posting_date_filter = []
 		self.dimensions = get_dimensions(with_cost_center_and_project=True)[0]
-		self.user_permissions = get_user_permissions(frappe.session.user)
+
+	@property
+	def user_permissions(self):
+		return get_user_permissions(frappe.session.user)
 
 	def load_from_db(self):
 		# 'modified' attribute is required for `run_doc_method` to work properly.
@@ -482,9 +486,6 @@ class PaymentReconciliation(Document):
 			"Accounts Settings", "exchange_gain_loss_posting_date", cache=True
 		)
 		invoice_exchange_map = self.get_invoice_exchange_map(args.get("invoices"), args.get("payments"))
-		default_exchange_gain_loss_account = frappe.get_cached_value(
-			"Company", self.company, "exchange_gain_loss_account"
-		)
 
 		entries = []
 		for pay in args.get("payments"):
@@ -504,7 +505,10 @@ class PaymentReconciliation(Document):
 					pay["exchange_rate"] = invoice_exchange_map.get(pay.get("reference_name"))
 
 				res.difference_amount = self.get_difference_amount(pay, inv, res["allocated_amount"])
-				res.difference_account = default_exchange_gain_loss_account
+				is_gain = (
+					res.difference_amount > 0 if self.party_type == "Customer" else res.difference_amount < 0
+				)
+				res.difference_account = get_exchange_gain_loss_account(self.company, is_gain)
 				res.exchange_rate = inv.get("exchange_rate")
 				res.update({"gain_loss_posting_date": pay.get("posting_date")})
 				if not pay.get("is_advance"):
@@ -833,10 +837,17 @@ class PaymentReconciliation(Document):
 
 
 def reconcile_dr_cr_note(dr_cr_notes, company, active_dimensions=None):
+	allocated_amount_precision = get_field_precision(
+		frappe.get_meta("Payment Reconciliation Allocation").get_field("allocated_amount")
+	)
 	for inv in dr_cr_notes:
 		if (
-			abs(frappe.db.get_value(inv.voucher_type, inv.voucher_no, "outstanding_amount"))
-			< inv.allocated_amount
+			flt(
+				abs(frappe.db.get_value(inv.voucher_type, inv.voucher_no, "outstanding_amount"))
+				- inv.allocated_amount,
+				allocated_amount_precision,
+			)
+			< 0
 		):
 			frappe.throw(
 				_("{0} has been modified after you pulled it. Please pull it again.").format(inv.voucher_type)

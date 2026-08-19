@@ -171,9 +171,10 @@ def send_mail(entry, email_campaign):
 		context = {"doc": frappe.get_doc("Email Group", recipient)}
 
 	# Render template
-	subject = frappe.render_template(email_template.get("subject"), context)
-	content = frappe.render_template(email_template.response_, context)
+	subject = frappe.render_template(email_template.get("subject"), context, restrict_globals=True)
+	content = frappe.render_template(email_template.response_, context, restrict_globals=True)
 
+	frappe.db.savepoint("email_campaign_send")
 	try:
 		comm = make(
 			doctype="Email Campaign",
@@ -197,6 +198,7 @@ def send_mail(entry, email_campaign):
 			queue_separately=True,
 		)
 	except Exception:
+		frappe.db.rollback(save_point="email_campaign_send")
 		frappe.log_error(title="Email Campaign Failed.")
 
 	return comm

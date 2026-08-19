@@ -60,7 +60,7 @@ def get_returned_qty_map(delivery_note: str) -> dict:
 
 @frappe.whitelist()
 def make_sales_invoice(
-	source_name: str, target_doc: str | Document | None = None, args: dict | str | None = None
+	source_name: str, target_doc: str | dict | Document | None = None, args: dict | str | None = None
 ):
 	from frappe.contacts.doctype.address.address import get_company_address
 
@@ -171,7 +171,12 @@ def make_sales_invoice(
 		frappe.get_single_value("Accounts Settings", "automatically_fetch_payment_terms")
 	)
 
-	if not doc.is_return:
+	if doc.is_return:
+		# A credit note made from a return Delivery Note should roll back the billed
+		# amount on the linked Sales Order too, so that per_billed stays consistent with
+		# per_delivered (which the return already reset).
+		doc.update_billed_amount_in_sales_order = True
+	else:
 		from erpnext.accounts.services.payment_schedule import PaymentScheduleService
 
 		ps = PaymentScheduleService(doc)
@@ -198,7 +203,7 @@ def make_sales_invoice(
 
 @frappe.whitelist()
 def make_delivery_trip(
-	source_name: str, target_doc: str | Document | None = None, kwargs: dict | None = None
+	source_name: str, target_doc: str | dict | Document | None = None, kwargs: dict | None = None
 ):
 	if not target_doc:
 		target_doc = frappe.new_doc("Delivery Trip")
@@ -230,7 +235,7 @@ def make_delivery_trip(
 
 @frappe.whitelist()
 def make_installation_note(
-	source_name: str, target_doc: str | Document | None = None, kwargs: dict | None = None
+	source_name: str, target_doc: str | dict | Document | None = None, kwargs: dict | None = None
 ):
 	def update_item(obj, target, source_parent):
 		target.qty = flt(obj.qty) - flt(obj.installed_qty)
@@ -259,7 +264,7 @@ def make_installation_note(
 
 
 @frappe.whitelist()
-def make_packing_slip(source_name: str, target_doc: str | Document | None = None):
+def make_packing_slip(source_name: str, target_doc: str | dict | Document | None = None):
 	def set_missing_values(source, target):
 		target.run_method("set_missing_values")
 
@@ -313,7 +318,7 @@ def make_packing_slip(source_name: str, target_doc: str | Document | None = None
 
 
 @frappe.whitelist()
-def make_shipment(source_name: str, target_doc: str | Document | None = None):
+def make_shipment(source_name: str, target_doc: str | dict | Document | None = None):
 	def postprocess(source, target):
 		user = frappe.db.get_value(
 			"User", frappe.session.user, ["email", "full_name", "phone", "mobile_no"], as_dict=1
@@ -394,14 +399,14 @@ def make_shipment(source_name: str, target_doc: str | Document | None = None):
 
 
 @frappe.whitelist()
-def make_sales_return(source_name: str, target_doc: str | Document | None = None):
+def make_sales_return(source_name: str, target_doc: str | dict | Document | None = None):
 	from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 	return make_return_doc("Delivery Note", source_name, target_doc)
 
 
 @frappe.whitelist()
-def make_inter_company_purchase_receipt(source_name: str, target_doc: str | Document | None = None):
+def make_inter_company_purchase_receipt(source_name: str, target_doc: str | dict | Document | None = None):
 	return make_inter_company_transaction("Delivery Note", source_name, target_doc)
 
 

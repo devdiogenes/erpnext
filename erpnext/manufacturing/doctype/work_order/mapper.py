@@ -9,10 +9,12 @@ the controller; work_order.py re-exports them for backward compatibility.
 """
 
 import json
+import math
 from functools import partial
 
 import frappe
 from frappe import _
+from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.utils import cint, flt, get_link_to_form, nowdate
 
@@ -115,7 +117,7 @@ def make_work_order(
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
 	item_details = get_item_details(item, project)
-	bom_no = _variant_default_bom(item) or bom_no
+	bom_no = _variant_default_bom(item, bom_no) or bom_no
 	wo_doc = _new_work_order(item, bom_no, company, item_details, use_multi_level_bom)
 
 	if flt(qty) > 0:
@@ -128,8 +130,11 @@ def make_work_order(
 	return wo_doc
 
 
-def _variant_default_bom(item):
+def _variant_default_bom(item, bom_no=None):
 	if not frappe.db.get_value("Item", item, "variant_of"):
+		return None
+	# selected BOM already belongs to this variant
+	if bom_no and frappe.db.get_value("BOM", bom_no, "item") == item:
 		return None
 	return frappe.db.get_value("BOM", {"item": item, "is_default": 1, "docstatus": 1})
 
@@ -307,6 +312,7 @@ def get_operation_details(name, work_order, parent_bom):
 	for row in work_order.operations:
 		if row.name == name:
 			return {
+				"idx": row.idx,
 				"workstation": row.workstation,
 				"workstation_type": row.workstation_type,
 				"source_warehouse": row.source_warehouse,
@@ -384,7 +390,7 @@ def validate_operation_data(row):
 		)
 
 
-def create_job_card(work_order, row, enable_capacity_planning=False, auto_create=False):
+def create_job_card(work_order, row, enable_capacity_planning=False, auto_create=False, schedule_blocks=None):
 	doc = frappe.new_doc("Job Card")
 	doc.update(_job_card_values(work_order, row))
 
@@ -397,9 +403,9 @@ def create_job_card(work_order, row, enable_capacity_planning=False, auto_create
 		doc.set_secondary_items()
 
 	if auto_create:
-		_auto_create_job_card(doc, row, enable_capacity_planning)
+		_auto_create_job_card(doc, row, enable_capacity_planning, schedule_blocks)
 
-	if enable_capacity_planning:
+	if enable_capacity_planning or schedule_blocks:
 		# automatically added scheduling rows shouldn't change status to WIP
 		doc.db_set("status", "Open")
 
@@ -451,13 +457,30 @@ def _job_card_warehouse_values(work_order, row, qty):
 	}
 
 
-def _auto_create_job_card(doc, row, enable_capacity_planning):
+def _auto_create_job_card(doc, row, enable_capacity_planning, schedule_blocks=None):
 	doc.flags.ignore_mandatory = True
-	if enable_capacity_planning:
+	if schedule_blocks:
+		_apply_schedule_blocks(doc, schedule_blocks)
+	elif enable_capacity_planning:
 		doc.schedule_time_logs(row)
 
 	doc.insert()
 	frappe.msgprint(_("Job card {0} created").format(get_link_to_form("Job Card", doc.name)), alert=True)
+
+
+def _apply_schedule_blocks(doc, schedule_blocks):
+	if schedule_blocks[0].workstation:
+		doc.workstation = schedule_blocks[0].workstation
+
+	for block in schedule_blocks:
+		doc.append(
+			"scheduled_time_logs",
+			{
+				"from_time": block.from_time,
+				"to_time": block.to_time,
+				"time_in_mins": flt(block.duration_mins),
+			},
+		)
 
 
 def get_work_order_operation_data(work_order, operation, workstation):
@@ -467,44 +490,109 @@ def get_work_order_operation_data(work_order, operation, workstation):
 
 
 @frappe.whitelist()
-def create_pick_list(source_name: str, target_doc: str | dict | None = None, for_qty: float | None = None):
+def create_pick_list(
+	source_name: str, target_doc: str | dict | Document | None = None, for_qty: float | None = None
+):
 	frappe.has_permission("Pick List", "create", throw=True)
 
-	for_qty = for_qty or frappe.parse_json(target_doc).get("for_qty")
-	max_finished_goods_qty = frappe.db.get_value("Work Order", source_name, "qty")
-	postprocess = partial(
-		_set_pick_list_item_qty, for_qty=for_qty, max_finished_goods_qty=max_finished_goods_qty
-	)
+	if for_qty is None:
+		for_qty = frappe.parse_json(target_doc or "{}").get("for_qty")
 
-	doc = get_mapped_doc("Work Order", source_name, _pick_list_mapping(postprocess), target_doc)
+	for_qty = _validated_for_qty(for_qty)
+	work_order = frappe.get_doc("Work Order", source_name)
+	allocation = _allocate_material_demand(work_order, for_qty / flt(work_order.qty))
+	postprocess = partial(_set_pick_list_item_qty, allocation_by_item=allocation)
+
+	doc = get_mapped_doc("Work Order", source_name, _pick_list_mapping(postprocess, allocation), target_doc)
+	_validate_material_is_pending(doc.locations)
 	doc.purpose = "Material Transfer for Manufacture"
 	doc.for_qty = for_qty
 	doc.set_item_locations()
 	return doc
 
 
-def _pick_list_mapping(postprocess):
+def _pick_list_mapping(postprocess, allocation):
 	return {
 		"Work Order": {"doctype": "Pick List", "validation": {"docstatus": ["=", 1]}},
 		"Work Order Item": {
 			"doctype": "Pick List Item",
+			"field_no_map": ["transferred_qty"],
 			"postprocess": postprocess,
-			"condition": lambda doc: abs(doc.transferred_qty) < abs(doc.required_qty),
+			"condition": lambda doc: _allocation_key(doc) in allocation,
 		},
 	}
 
 
-def _set_pick_list_item_qty(source, target, source_parent, for_qty, max_finished_goods_qty):
-	pending_to_issue = flt(source.required_qty) - flt(source.transferred_qty)
-	desire_to_transfer = flt(source.required_qty) / max_finished_goods_qty * flt(for_qty)
+def _allocate_material_demand(work_order, fraction):
+	"""Fraction of each (item, warehouse, operation row) group's requirement, capped
+	at the group's proportional share of the item's pending pool."""
+	required_by_item = {}
+	covered_by_item = {}
+	required_by_group = {}
+	for row in work_order.required_items:
+		required_by_item[row.item_code] = required_by_item.get(row.item_code, 0.0) + flt(row.required_qty)
+		covered_by_item.setdefault(
+			row.item_code,
+			flt(row.transferred_qty) + flt(row.requested_qty) + flt(row.picked_qty),
+		)
+		key = _allocation_key(row)
+		required_by_group[key] = required_by_group.get(key, 0.0) + flt(row.required_qty)
 
-	qty = 0
-	if desire_to_transfer <= pending_to_issue:
-		qty = desire_to_transfer
-	elif pending_to_issue > 0:
-		qty = pending_to_issue
+	pending_pool = {
+		item_code: required_qty - covered_by_item[item_code]
+		for item_code, required_qty in required_by_item.items()
+	}
 
-	if not qty:
+	allocation = {}
+	for key, required_qty in required_by_group.items():
+		item_code = key[0]
+		if required_by_item[item_code] <= 0:
+			continue
+
+		pool_share = pending_pool[item_code] * required_qty / required_by_item[item_code]
+		qty = min(required_qty * fraction, pool_share)
+		if qty > 0:
+			allocation[key] = qty
+	return allocation
+
+
+def _allocation_key(row):
+	"""Manual rows have no operation_row_id; their operation label splits them."""
+	return (row.item_code, row.source_warehouse, cint(row.operation_row_id) or row.operation)
+
+
+def _merge_allocation_per_item(allocation):
+	"""Material Request rejects repeated item codes unless Buying Settings allows them."""
+	merged = {}
+	key_by_item = {}
+	for key, qty in allocation.items():
+		item_code = key[0]
+		if item_code in key_by_item:
+			merged[key_by_item[item_code]] += qty
+		else:
+			key_by_item[item_code] = key
+			merged[key] = qty
+	return merged
+
+
+def _validated_for_qty(for_qty):
+	qty = flt(for_qty)
+	if not math.isfinite(qty) or qty <= 0:
+		frappe.throw(_("Quantity must be greater than zero."))
+	return qty
+
+
+def _validate_material_is_pending(rows):
+	if not rows:
+		frappe.throw(
+			_("All required items have already been transferred, requested or picked."),
+			title=_("No Pending Materials"),
+		)
+
+
+def _set_pick_list_item_qty(source, target, source_parent, allocation_by_item):
+	qty = allocation_by_item.pop(_allocation_key(source), 0.0)
+	if qty <= 0:
 		target.delete()
 		return
 
@@ -513,6 +601,62 @@ def _set_pick_list_item_qty(source, target, source_parent, for_qty, max_finished
 	target.uom = frappe.get_value("Item", source.item_code, "stock_uom")
 	target.stock_uom = target.uom
 	target.conversion_factor = 1
+
+
+@frappe.whitelist()
+def make_material_request(
+	source_name: str, target_doc: str | dict | Document | None = None, for_qty: float | None = None
+):
+	frappe.has_permission("Material Request", "create", throw=True)
+
+	if for_qty is None and frappe.flags.args:
+		for_qty = frappe.flags.args.for_qty
+
+	work_order = frappe.get_doc("Work Order", source_name)
+	fraction = 1.0
+	if for_qty is not None:
+		fraction = _validated_for_qty(for_qty) / flt(work_order.qty)
+
+	allocation = _allocate_material_demand(work_order, fraction)
+	if not cint(frappe.db.get_single_value("Buying Settings", "allow_multiple_items")):
+		allocation = _merge_allocation_per_item(allocation)
+	postprocess = partial(_set_material_request_item, allocation_by_item=allocation)
+	doc = get_mapped_doc(
+		"Work Order", source_name, _material_request_mapping(postprocess, allocation), target_doc
+	)
+	_validate_material_is_pending(doc.items)
+	doc.material_request_type = "Material Transfer"
+	return doc
+
+
+def _material_request_mapping(postprocess, allocation):
+	return {
+		"Work Order": {
+			"doctype": "Material Request",
+			"validation": {"docstatus": ["=", 1]},
+			"field_map": {"name": "work_order"},
+		},
+		"Work Order Item": {
+			"doctype": "Material Request Item",
+			"field_map": [
+				("stock_uom", "uom"),
+				("source_warehouse", "from_warehouse"),
+			],
+			"postprocess": postprocess,
+			"condition": lambda doc: _allocation_key(doc) in allocation,
+		},
+	}
+
+
+def _set_material_request_item(source, target, source_parent, allocation_by_item):
+	qty = allocation_by_item.pop(_allocation_key(source), 0.0)
+	if qty <= 0:
+		target.delete()
+		return
+
+	target.warehouse = source_parent.wip_warehouse
+	target.qty = qty
+	target.schedule_date = nowdate()
 
 
 @frappe.whitelist()

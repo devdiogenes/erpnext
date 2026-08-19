@@ -29,7 +29,7 @@ frappe.ui.form.on("Journal Entry", {
 
 	refresh(frm) {
 		if (frm.doc.reversal_of && (frm.is_new() || frm.doc.docstatus == 0)) {
-			frm.set_read_only();
+			erpnext.journal_entry.lock_reversal_entry(frm);
 		}
 
 		erpnext.toggle_naming_series();
@@ -232,6 +232,14 @@ Object.assign(erpnext.journal_entry, {
 		}
 	},
 
+	lock_reversal_entry(frm) {
+		frm.fields
+			.filter((field) => field.has_input)
+			.filter((field) => !["posting_date", "custom_remark", "remark"].includes(field.df.fieldname))
+			.forEach((field) => frm.set_df_property(field.df.fieldname, "read_only", 1));
+		frm.set_df_property("accounts", "read_only", 1);
+	},
+
 	add_custom_buttons(frm) {
 		if (frm.doc.docstatus > 0) {
 			frm.add_custom_button(
@@ -241,7 +249,7 @@ Object.assign(erpnext.journal_entry, {
 			);
 		}
 
-		if (frm.doc.docstatus == 1) {
+		if (frm.doc.docstatus == 1 && !frm.doc.reversal_of) {
 			frm.add_custom_button(
 				__("Reverse Journal Entry"),
 				() => erpnext.journal_entry.reverse_journal_entry(frm),

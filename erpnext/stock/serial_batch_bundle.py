@@ -6,6 +6,7 @@ from frappe.model.naming import NamingSeries, parse_naming_series
 from frappe.query_builder.functions import Max, Sum
 from frappe.utils import add_days, cint, cstr, flt, get_link_to_form, getdate, now
 from pypika import Order
+from pypika.terms import ExistsCriterion
 
 from erpnext.stock.deprecated_serial_batch import (
 	DeprecatedBatchNoValuation,
@@ -788,6 +789,9 @@ class SerialNoValuation(DeprecatedSerialNoValuation):
 		return is_rejected(self.sle.voucher_type, self.sle.voucher_detail_no, self.sle.warehouse)
 
 	def get_incoming_rate(self):
+		if not self.sle.actual_qty and self.sle.voucher_type == "Stock Reconciliation":
+			return 0.0
+
 		return abs(flt(self.stock_value_change) / flt(self.sle.actual_qty))
 
 	def get_incoming_rate_of_serial_no(self, serial_no):
@@ -821,19 +825,75 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 				"Serial and Batch Bundle", self.sle.serial_and_batch_bundle, "total_amount"
 			)
 		else:
-			entries = self.get_batch_stock_before_date()
+			# Serialize concurrent valuations of this (item, warehouse) on postgres. MariaDB's
+			# grouped FOR UPDATE + gap locks do this via the history reads below; postgres has no
+			# gap locks, and row-locking the whole history writes a lock marker on every tuple --
+			# a txn-scoped advisory lock (released at commit/rollback) serializes without either.
+			if frappe.db.db_type == "postgres":
+				frappe.db.transaction_advisory_lock(
+					("batch-valuation", self.sle.item_code, self.sle.warehouse)
+				)
+
 			self.stock_value_change = 0.0
 			self.batch_avg_rate = defaultdict(float)
 			self.available_qty = defaultdict(float)
 			self.stock_value_differece = defaultdict(float)
 
-			for ledger in entries:
+			self.seed_from_stock_closing_balance()
+
+			for ledger in self.get_batch_stock_before_date():
 				self.stock_value_differece[ledger.batch_no] += flt(ledger.incoming_rate)
 				self.available_qty[ledger.batch_no] += flt(ledger.qty)
 
 			self.calculate_avg_rate_from_deprecarated_ledgers()
 			self.calculate_avg_rate_for_non_batchwise_valuation()
 			self.set_stock_value_difference()
+
+	def seed_from_stock_closing_balance(self):
+		self.stock_closing_from_datetime = None
+		closing_entry = self.get_closing_entry_for_seeding()
+		if not closing_entry:
+			return
+
+		from erpnext.stock.utils import get_combine_datetime
+
+		self.stock_closing_from_datetime = get_combine_datetime(
+			add_days(closing_entry.to_date, 1), "00:00:00"
+		)
+
+		for row in self.get_stock_closing_balance_entries(closing_entry.name):
+			self.stock_value_differece[row.batch_no] += flt(row.stock_value_difference)
+			self.available_qty[row.batch_no] += flt(row.actual_qty)
+
+	def get_closing_entry_for_seeding(self):
+		from erpnext.stock.doctype.stock_closing_entry.stock_closing_entry import (
+			get_closing_entry_for_closed_period,
+		)
+
+		if not self.batchwise_valuation_batches or not self.sle.posting_date:
+			return None
+
+		company = self.sle.company or frappe.get_cached_value("Warehouse", self.sle.warehouse, "company")
+		closing_entry = get_closing_entry_for_closed_period(company)
+		if not closing_entry or getdate(self.sle.posting_date) <= getdate(closing_entry.to_date):
+			return None
+
+		return closing_entry
+
+	def get_stock_closing_balance_entries(self, closing_entry):
+		table = frappe.qb.DocType("Stock Closing Balance")
+
+		return (
+			frappe.qb.from_(table)
+			.select(table.batch_no, table.actual_qty, table.stock_value_difference)
+			.where(
+				(table.stock_closing_entry == closing_entry)
+				& (table.item_code == self.sle.item_code)
+				& (table.warehouse == self.sle.warehouse)
+				& table.batch_no.isin(self.batchwise_valuation_batches)
+				& (table.inventory_dimension_key.isnull() | (table.inventory_dimension_key == ""))
+			)
+		).run(as_dict=True)
 
 	def get_batch_stock_before_date(self) -> list[dict]:
 		# Get batch wise stock value difference from Serial and Batch Bundle considering time condition
@@ -842,14 +902,45 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 
 		child = frappe.qb.DocType("Serial and Batch Entry")
 
+		sle_creation = self.sle.creation if self.sle.get("name") else None
+		if not self.sle.get("name") and self.sle.get("serial_and_batch_bundle"):
+			sle_creation = frappe.db.get_value(
+				"Stock Ledger Entry",
+				{"serial_and_batch_bundle": self.sle.serial_and_batch_bundle, "is_cancelled": 0},
+				"creation",
+			)
+
 		timestamp_condition = ""
 		if self.sle.posting_datetime:
 			timestamp_condition = child.posting_datetime < self.sle.posting_datetime
 
-			if self.sle.creation:
-				timestamp_condition |= (child.posting_datetime == self.sle.posting_datetime) & (
-					child.creation < self.sle.creation
+			sle_table = frappe.qb.DocType("Stock Ledger Entry")
+			if sle_creation:
+				# bundle creation and SLE creation are different timelines (a
+				# bundle can be created much before its SLE), so break the tie
+				# using the creation of the bundle's own SLE
+				tie_condition = ExistsCriterion(
+					frappe.qb.from_(sle_table)
+					.select(sle_table.name)
+					.where(
+						(sle_table.serial_and_batch_bundle == child.parent)
+						& (sle_table.is_cancelled == 0)
+						& (sle_table.creation < sle_creation)
+					)
 				)
+			else:
+				# the current entry is not yet in the ledger and will get the
+				# latest creation, so the same-timestamp entries which are
+				# already in the ledger precede it
+				tie_condition = ExistsCriterion(
+					frappe.qb.from_(sle_table)
+					.select(sle_table.name)
+					.where(
+						(sle_table.serial_and_batch_bundle == child.parent) & (sle_table.is_cancelled == 0)
+					)
+				)
+
+			timestamp_condition |= (child.posting_datetime == self.sle.posting_datetime) & tie_condition
 
 		conditions = (
 			(child.item_code == self.sle.item_code)
@@ -869,12 +960,12 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 		if timestamp_condition:
 			conditions &= timestamp_condition
 
-		# Lock the scanned rows so a concurrent stock transaction can't change them mid-valuation.
-		# MariaDB carries the lock on the grouped query; postgres rejects FOR UPDATE with GROUP BY, so
-		# lock the same rows in a separate plain SELECT first (held for the transaction).
-		if frappe.db.db_type == "postgres":
-			frappe.qb.from_(child).select(child.name).where(conditions).for_update().run()
+		if self.stock_closing_from_datetime:
+			conditions &= child.posting_datetime >= self.stock_closing_from_datetime
 
+		# MariaDB carries a row lock on the grouped query below; on postgres the caller
+		# (calculate_avg_rate) serializes via a txn-scoped advisory lock on (item, warehouse)
+		# instead of row-locking the whole history (FOR UPDATE is invalid with GROUP BY there).
 		query = (
 			frappe.qb.from_(child)
 			.select(
@@ -899,6 +990,11 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 
 		self.batchwise_valuation_batches = []
 		self.non_batchwise_valuation_batches = []
+
+		if batchwise_batches := self.sle.get("batchwise_valuation_batches"):
+			self.batchwise_valuation_batches = list(batchwise_batches)
+			self.non_batchwise_valuation_batches = list(set(self.batches) - set(batchwise_batches))
+			return
 
 		if get_valuation_method(
 			self.sle.item_code, self.sle.company
@@ -1342,6 +1438,15 @@ class SerialBatchCreation:
 	def set_serial_batch_entries(self, doc):
 		incoming_rate = self.get("incoming_rate")
 
+		standard_rate = self.get_standard_cost_rate()
+		if standard_rate is not None:
+			# Standard Cost values every serial/batch at the same rate, so the bundle entries
+			# must carry the standard rate (not the document/billed rate) to stay consistent
+			# with the standard-valued Stock Ledger Entry.
+			incoming_rate = standard_rate
+			self.serial_nos_valuation = None
+			self.batches_valuation = None
+
 		precision = frappe.get_precision("Serial and Batch Entry", "qty")
 		if self.get("serial_nos"):
 			serial_no_wise_batch = frappe._dict({})
@@ -1377,6 +1482,25 @@ class SerialBatchCreation:
 						"incoming_rate": incoming_rate,
 					},
 				)
+
+	def get_standard_cost_rate(self):
+		"""Return the standard valuation rate for the item if its valuation method is
+		Standard Cost, else None — used to value bundle entries at standard."""
+		from erpnext.stock.doctype.item_standard_cost.item_standard_cost import get_item_standard_rate
+		from erpnext.stock.utils import get_valuation_method
+
+		company = self.get("company")
+		if not company and self.get("warehouse"):
+			company = frappe.get_cached_value("Warehouse", self.warehouse, "company")
+
+		if not company or get_valuation_method(self.item_code, company) != "Standard Cost":
+			return None
+
+		posting_date = self.get("posting_date")
+		if not posting_date and self.get("posting_datetime"):
+			posting_date = getdate(self.posting_datetime)
+
+		return get_item_standard_rate(self.item_code, company, posting_date)
 
 	def create_batch(self):
 		from erpnext.stock.doctype.batch.batch import make_batch
@@ -1533,7 +1657,7 @@ def update_batch_qty(voucher_type, voucher_no, docstatus, via_landed_cost_vouche
 		return
 
 	precision = frappe.get_precision("Batch", "batch_qty")
-	for batch, qty in batches.items():
+	for batch, qty in sorted(batches.items()):
 		current_qty = get_batch_current_qty(batch)
 		current_qty += flt(qty, precision) * (-1 if docstatus == 2 else 1)
 

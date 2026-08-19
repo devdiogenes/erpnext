@@ -66,7 +66,7 @@ jobs:
         run: echo "127.0.0.1 test_site" | sudo tee -a /etc/hosts
 
       # The v14 baseline backup is a fixed published file — cache it instead of re-downloading
-      # ~100MB from frappe.io every run.
+      # it from the GitHub release every run.
       - name: Cache erpnext v14 backup
         id: cache-v14
         uses: actions/cache@v4
@@ -76,7 +76,10 @@ jobs:
 
       - name: Download erpnext v14 backup
         if: steps.cache-v14.outputs.cache-hit != 'true'
-        run: wget -O ~/erpnext-v14.sql.gz https://frappe.io/files/erpnext-v14.sql.gz
+        run: |
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o ~/erpnext-v14.sql.gz \
+            https://github.com/frappe/erpnext/releases/download/v14-baseline/erpnext-v14.sql.gz
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -168,7 +171,30 @@ jobs:
           update_to_version 16 3.14
 
           echo "Updating to latest version"
-          git -C "apps/frappe" fetch --depth 1 upstream "${GITHUB_BASE_REF:-${GITHUB_REF##*/}}"
+          fallback_to_develop=0
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            frappe_ref="refs/heads/$GITHUB_BASE_REF"
+            fallback_to_develop=1
+          elif [ "${GITHUB_REF_TYPE:-}" = "branch" ]; then
+            frappe_ref="$GITHUB_REF"
+            fallback_to_develop=1
+          elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            frappe_ref="$GITHUB_REF"
+          else
+            echo "Unsupported GitHub ref type: '${GITHUB_REF_TYPE:-unset}'"
+            exit 1
+          fi
+
+          ls_remote_status=0
+          git -C "apps/frappe" ls-remote --exit-code upstream "$frappe_ref" >/dev/null \
+            || ls_remote_status=$?
+          if [ "$ls_remote_status" -eq 2 ] && [ "$fallback_to_develop" -eq 1 ]; then
+            echo "frappe has no '$frappe_ref'; falling back to develop"
+            frappe_ref=refs/heads/develop
+          elif [ "$ls_remote_status" -ne 0 ]; then
+            exit "$ls_remote_status"
+          fi
+          git -C "apps/frappe" fetch --depth 1 upstream "$frappe_ref"
           git -C "apps/frappe" checkout -q -f FETCH_HEAD
           git -C "apps/erpnext" checkout -q -f "$GITHUB_SHA"
 

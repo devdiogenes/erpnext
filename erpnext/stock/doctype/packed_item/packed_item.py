@@ -12,7 +12,7 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import flt
 
-from erpnext.stock.get_item_details import ItemDetailsCtx, get_item_details, get_price_list_rate
+from erpnext.stock.get_item_details import get_item_details, get_price_list_rate
 
 
 class PackedItem(Document):
@@ -56,16 +56,7 @@ class PackedItem(Document):
 		warehouse: DF.Link | None
 	# end: auto-generated types
 
-	def set_actual_and_projected_qty(self):
-		"Set actual and projected qty based on warehouse and item_code"
-		_bin = frappe.db.get_value(
-			"Bin",
-			{"item_code": self.item_code, "warehouse": self.warehouse},
-			["actual_qty", "projected_qty"],
-			as_dict=True,
-		)
-		self.actual_qty = _bin.actual_qty if _bin else 0
-		self.projected_qty = _bin.projected_qty if _bin else 0
+	pass
 
 
 def make_packing_list(doc):
@@ -326,7 +317,8 @@ def update_packed_item_with_pick_list_info(main_item_row, pi_row):
 		},
 		["warehouse", "batch_no", "serial_no"],
 		as_dict=True,
-		order_by="qty desc",
+		# name tiebreaker: split pick-list rows can tie on qty -> pick the same warehouse/batch/serial on both engines
+		order_by="qty desc, name asc",
 	)
 
 	if not pl_row:
@@ -343,7 +335,7 @@ def update_packed_item_price_data(pi_row, item_data, doc):
 		return
 
 	item_doc = frappe.get_cached_doc("Item", pi_row.item_code)
-	ctx = ItemDetailsCtx(pi_row.as_dict().copy())
+	ctx = frappe._dict(pi_row.as_dict().copy())
 	ctx.update(
 		{
 			"company": doc.get("company"),
@@ -441,7 +433,7 @@ def get_items_from_product_bundle(row: str | dict):
 	"""
 	from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
 
-	row, items = ItemDetailsCtx(frappe.parse_json(row)), []
+	row, items = frappe._dict(frappe.parse_json(row)), []
 
 	if bundle_name := row.get("product_bundle"):
 		frappe.has_permission("Product Bundle", "read", bundle_name, throw=True)

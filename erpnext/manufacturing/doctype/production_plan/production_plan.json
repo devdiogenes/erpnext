@@ -40,6 +40,7 @@
   "column_break_igxl",
   "skip_available_sub_assembly_item",
   "combine_sub_items",
+  "no_of_shifts",
   "get_sub_assembly_items",
   "section_break_g4ip",
   "sub_assembly_items",
@@ -52,6 +53,7 @@
   "include_safety_stock",
   "ignore_existing_ordered_qty",
   "column_break_25",
+  "raw_material_group_warehouse",
   "for_warehouse",
   "get_items_for_mr",
   "transfer_materials",
@@ -319,6 +321,13 @@
    "options": "Warehouse"
   },
   {
+   "description": "Optional group warehouse. Raw material availability is checked across its child warehouses; material is still received into For Warehouse.",
+   "fieldname": "raw_material_group_warehouse",
+   "fieldtype": "Link",
+   "label": "Raw Material Group Warehouse",
+   "options": "Warehouse"
+  },
+  {
    "fieldname": "warehouses",
    "fieldtype": "Table MultiSelect",
    "hidden": 1,
@@ -438,6 +447,12 @@
    "fieldname": "reserve_stock",
    "fieldtype": "Check",
    "label": "Reserve Stock"
+  },
+  {
+   "description": "Used by scheduling when an item has no BOM operations: scales the Item Lead Time daily capacity to this many shifts.",
+   "fieldname": "no_of_shifts",
+   "fieldtype": "Int",
+   "label": "No of Shifts"
   }
  ],
  "grid_page_length": 50,
@@ -445,7 +460,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2025-08-12 19:48:09.302503",
+ "modified": "2026-08-12 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Manufacturing",
  "name": "Production Plan",

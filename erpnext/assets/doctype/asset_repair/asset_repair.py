@@ -67,14 +67,18 @@ class AssetRepair(AccountsController):
 		self.calculate_repair_cost()
 		self.calculate_total_repair_cost()
 		self.check_repair_status()
+		self.set_downtime()
 
 	def validate_asset(self):
-		if self.asset_doc.status in ("Sold", "Fully Depreciated", "Scrapped"):
+		if self.asset_doc.status in ("Sold", "Scrapped"):
 			frappe.throw(
 				_("Asset {0} is in {1} status and cannot be repaired.").format(
 					get_link_to_form("Asset", self.asset), self.asset_doc.status
 				)
 			)
+		if self.asset_doc.get_status() == "Fully Depreciated":
+			self.capitalize_repair_cost = 0
+			self.increase_in_asset_life = 0
 
 	def validate_dates(self):
 		if self.completion_date and (getdate(self.failure_date) > getdate(self.completion_date)):
@@ -235,6 +239,13 @@ class AssetRepair(AccountsController):
 	def check_repair_status(self):
 		if self.repair_status == "Pending" and self.docstatus == 1:
 			frappe.throw(_("Please update Repair Status."))
+
+	def set_downtime(self):
+		# keep downtime in sync with the entered dates, regardless of edit order
+		if self.repair_status == "Completed" and self.failure_date and self.completion_date:
+			self.downtime = f"{get_downtime(self.failure_date, self.completion_date)} Hrs"
+		else:
+			self.downtime = None
 
 	def update_asset_value(self):
 		total_repair_cost = self.total_repair_cost if self.docstatus == 1 else -1 * self.total_repair_cost

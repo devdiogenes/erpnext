@@ -206,6 +206,7 @@ class Workstation(Document):
 			(
 				frappe.qb.update(bom_op)
 				.set(bom_op.hour_rate, self.hour_rate)
+				.set(bom_op.operating_cost, self.hour_rate * bom_op.time_in_mins / 60)
 				.where(bom_op.parent.isin(bom_list) & (bom_op.workstation == self.name))
 				.run()
 			)
@@ -223,7 +224,7 @@ class Workstation(Document):
 
 		return schedule_date
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def start_job(self, job_card: str, from_time: DateTimeLikeObject, employee: str):
 		doc = frappe.get_doc("Job Card", job_card)
 		doc.check_permission("write")
@@ -233,7 +234,7 @@ class Workstation(Document):
 
 		return doc
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def complete_job(self, job_card: str, qty: float, to_time: DateTimeLikeObject):
 		doc = frappe.get_doc("Job Card", job_card)
 		doc.check_permission("submit")
@@ -241,84 +242,12 @@ class Workstation(Document):
 		for row in doc.time_logs:
 			if not row.to_time:
 				row.to_time = to_time
-				row.time_in_mins = time_diff_in_hours(row.to_time, row.from_time) / 60
 				row.completed_qty = qty
 
 		doc.save()
 		doc.submit()
 
 		return doc
-
-
-@frappe.whitelist()
-def get_job_cards(workstation: str):
-	if frappe.has_permission("Job Card", "read"):
-		jc_data = frappe.get_all(
-			"Job Card",
-			fields=[
-				"name",
-				"production_item",
-				"work_order",
-				"operation",
-				"total_completed_qty",
-				"for_quantity",
-				"process_loss_qty",
-				"finished_good",
-				"transferred_qty",
-				"status",
-				"expected_start_date",
-				"expected_end_date",
-				"time_required",
-				"wip_warehouse",
-				"skip_material_transfer",
-				"backflush_from_wip_warehouse",
-				"is_paused",
-				"manufactured_qty",
-			],
-			filters={
-				"workstation": workstation,
-				"is_subcontracted": 0,
-				"docstatus": ("<", 2),
-				"status": ["not in", ["Completed", "Stopped"]],
-			},
-			order_by="expected_start_date, expected_end_date",
-			limit=10,
-		)
-
-		job_cards = [row.name for row in jc_data]
-		time_logs = get_time_logs(job_cards)
-
-		allow_excess_transfer = frappe.db.get_single_value(
-			"Manufacturing Settings", "job_card_excess_transfer"
-		)
-
-		user_employee = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "name")
-
-		for row in jc_data:
-			if row.status == "Open":
-				row.status = "Not Started"
-
-			item_code = row.finished_good or row.production_item
-			row.fg_uom = frappe.get_cached_value("Item", item_code, "stock_uom")
-
-			row.status_colour = get_status_color(row.status)
-			row.job_card_link = f"""
-					<a class="ellipsis" data-doctype="Job Card" data-name="{row.name}" href="/app/job-card/{row.name}" title="" data-original-title="{row.name}">{row.name}</a>
-				"""
-
-			row.operation_link = f"""
-					<a class="ellipsis" data-doctype="Operation" data-name="{row.operation}" href="/app/operation/{row.operation}" title="" data-original-title="{row.operation}">{row.operation}</a>
-				"""
-			row.work_order_link = get_link_to_form("Work Order", row.work_order)
-
-			row.time_logs = time_logs.get(row.name, [])
-			row.make_material_request = False
-			if row.for_quantity > row.transferred_qty or allow_excess_transfer:
-				row.make_material_request = True
-
-			row.user_employee = user_employee
-
-		return jc_data
 
 
 def get_status_color(status):
@@ -328,7 +257,9 @@ def get_status_color(status):
 		"Submitted": "blue",
 		"Open": "gray",
 		"Closed": "green",
+		"Completed": "green",
 		"Work In Progress": "orange",
+		"To Manufacture": "purple",
 	}
 
 	return color_map.get(status, "blue")
@@ -520,12 +451,12 @@ def get_workstations(**kwargs):
 
 	for d in data:
 		d.workstation_name = get_link_to_form("Workstation", d.name)
-		d.status_image = d.on_status_image
+		d.status_image = frappe.utils.escape_html(d.on_status_image)
 		d.workstation_off = ""
 		d.color = color_map.get(d.status, "red")
 		d.workstation_link = get_url_to_form("Workstation", d.name)
 		if d.status != "Production":
-			d.status_image = d.off_status_image
+			d.status_image = frappe.utils.escape_html(d.off_status_image)
 			d.workstation_off = "workstation-off"
 
 	return data

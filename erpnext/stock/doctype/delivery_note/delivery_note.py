@@ -10,6 +10,7 @@ from erpnext.controllers.selling_controller import SellingController
 from erpnext.stock.doctype.delivery_note.services.billing_status import BillingStatusService
 from erpnext.stock.doctype.delivery_note.services.packing import PackingService
 from erpnext.stock.doctype.packed_item.packed_item import make_packing_list
+from erpnext.stock.utils import get_bin_qty_map
 
 form_grid_templates = {"items": "templates/form_grid/item_grid.html"}
 
@@ -118,6 +119,10 @@ class DeliveryNote(SellingController):
 		set_warehouse: DF.Link | None
 		shipping_address: DF.TextEditor | None
 		shipping_address_name: DF.Link | None
+		shipping_contact_display: DF.SmallText | None
+		shipping_contact_email: DF.Data | None
+		shipping_contact_mobile: DF.SmallText | None
+		shipping_contact_person: DF.Link | None
 		shipping_rule: DF.Link | None
 		status: DF.Literal[
 			"",
@@ -258,14 +263,6 @@ class DeliveryNote(SellingController):
 
 		super().before_print(settings)
 
-	def set_actual_qty(self):
-		for d in self.get("items"):
-			if d.item_code and d.warehouse:
-				actual_qty = frappe.db.get_value(
-					"Bin", {"item_code": d.item_code, "warehouse": d.warehouse}, "actual_qty"
-				)
-				d.actual_qty = flt(actual_qty) or 0
-
 	def so_required(self):
 		"""check in manage account if sales order required or not"""
 		if frappe.get_single_value("Selling Settings", "so_required") == "Yes":
@@ -401,22 +398,25 @@ class DeliveryNote(SellingController):
 				frappe.throw(_("Warehouse required for stock Item {0}").format(d["item_code"]))
 
 	def update_current_stock(self):
-		if self.get("_action") and self._action != "update_after_submit":
-			for d in self.get("items"):
-				d.actual_qty = frappe.db.get_value(
-					"Bin", {"item_code": d.item_code, "warehouse": d.warehouse}, "actual_qty"
-				)
+		if not (self.get("_action") and self._action != "update_after_submit"):
+			return
 
-			for d in self.get("packed_items"):
-				bin_qty = frappe.db.get_value(
-					"Bin",
-					{"item_code": d.item_code, "warehouse": d.warehouse},
-					["actual_qty", "projected_qty"],
-					as_dict=True,
-				)
-				if bin_qty:
-					d.actual_qty = flt(bin_qty.actual_qty)
-					d.projected_qty = flt(bin_qty.projected_qty)
+		bin_qty_map = get_bin_qty_map(self.get("items") + self.get("packed_items"))
+
+		for d in self.get("items"):
+			bin_data = bin_qty_map.get((d.item_code, d.warehouse))
+			d.actual_qty = bin_data.actual_qty if bin_data else None
+
+		for d in self.get("packed_items"):
+			bin_data = bin_qty_map.get((d.item_code, d.warehouse))
+			if bin_data:
+				d.actual_qty = flt(bin_data.actual_qty)
+				d.projected_qty = flt(bin_data.projected_qty)
+
+	def get_gl_entries(self, inventory_account_map=None):
+		from erpnext.stock.doctype.delivery_note.services.gl_composer import DeliveryNoteGLComposer
+
+		return DeliveryNoteGLComposer(self).compose(inventory_account_map)
 
 	def validate_expense_account(self):
 		company_values = frappe.get_cached_value(
@@ -426,6 +426,7 @@ class DeliveryNote(SellingController):
 				"stock_delivered_but_not_billed",
 				"disable_sdbnb_in_sr",
 				"default_expense_account",
+				"enable_stock_delivered_but_not_billed",
 			],
 			as_dict=True,
 		)
@@ -433,7 +434,7 @@ class DeliveryNote(SellingController):
 		sdbnb_account = company_values.stock_delivered_but_not_billed
 		disable_sdbnb_in_sr = company_values.disable_sdbnb_in_sr
 		default_expense_account = company_values.default_expense_account
-
+		is_enabled_sdbnb = company_values.enable_stock_delivered_but_not_billed
 		for item in self.items:
 			if item.get("against_sales_invoice"):
 				if sdbnb_account and item.expense_account == sdbnb_account:
@@ -447,20 +448,21 @@ class DeliveryNote(SellingController):
 				# Only stock items
 				if is_stock_item and not item.get("is_fixed_asset") and not item.get("is_subcontracted"):
 					# Sales Return handling
-					if self.is_return and disable_sdbnb_in_sr:
+					if self.is_return and disable_sdbnb_in_sr and sdbnb_account and is_enabled_sdbnb:
 						if default_expense_account and (
 							not item.expense_account or item.expense_account == sdbnb_account
 						):
 							item.expense_account = default_expense_account
 
-					elif sdbnb_account:
+					elif sdbnb_account and is_enabled_sdbnb:
 						item.expense_account = sdbnb_account
+					elif sdbnb_account and item.expense_account == sdbnb_account:
+						item.expense_account = default_expense_account
 			if not item.expense_account and default_expense_account:
 				item.expense_account = default_expense_account
 
 	def on_submit(self):
 		self.validate_packed_qty()
-		self.update_pick_list_status()
 
 		# Check for Approving Authority
 		frappe.get_cached_doc("Authorization Control").validate_approving_authority(
@@ -469,6 +471,7 @@ class DeliveryNote(SellingController):
 
 		# update delivered qty in sales order
 		self.update_prevdoc_status()
+		self.update_pick_list_status()
 		self.update_billing_status()
 
 		if not self.is_return:

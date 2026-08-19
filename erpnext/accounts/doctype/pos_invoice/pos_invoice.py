@@ -663,7 +663,6 @@ class POSInvoice(SalesInvoice):
 	def set_pos_fields(self, for_validate=False):
 		"""Set retail related fields from POS Profiles"""
 		from erpnext.stock.get_item_details import (
-			ItemDetailsCtx,
 			get_pos_profile,
 			get_pos_profile_item_details_,
 		)
@@ -736,7 +735,7 @@ class POSInvoice(SalesInvoice):
 			for item in self.get("items"):
 				if item.get("item_code"):
 					profile_details = get_pos_profile_item_details_(
-						ItemDetailsCtx(item.as_dict()), profile.get("company"), profile
+						frappe._dict(item.as_dict()), profile.get("company"), profile
 					)
 					for fname, val in profile_details.items():
 						if (not for_validate) or (for_validate and not item.get(fname)):
@@ -1026,7 +1025,7 @@ def get_pos_reserved_qty_from_table(child_table, item_code, warehouse):
 
 
 @frappe.whitelist()
-def make_sales_return(source_name: str, target_doc: Document | str | None = None):
+def make_sales_return(source_name: str, target_doc: str | dict | Document | None = None):
 	from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 	return make_return_doc("POS Invoice", source_name, target_doc)

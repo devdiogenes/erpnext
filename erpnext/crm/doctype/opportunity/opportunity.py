@@ -12,6 +12,7 @@ from frappe.query_builder import DocType, Interval
 from frappe.query_builder.functions import Now
 from frappe.utils import flt, get_fullname
 
+from erpnext.accounts.party import validate_party_frozen_disabled
 from erpnext.crm.utils import (
 	CRMNote,
 	copy_comments,
@@ -132,7 +133,9 @@ class Opportunity(TransactionBase, CRMNote):
 		self.validate_item_details()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_cust_name()
+		self.validate_party()
 		self.map_fields()
+		self.validate_qty()
 		self.set_exchange_rate()
 
 		if not self.title:
@@ -142,6 +145,15 @@ class Opportunity(TransactionBase, CRMNote):
 
 	def on_update(self):
 		self.update_prospect()
+
+	def validate_qty(self):
+		for item in self.items:
+			if flt(item.qty) <= 0:
+				frappe.throw(
+					_("Row #{0}: Quantity must be greater than 0 for Item {1}").format(
+						item.idx, item.item_code
+					)
+				)
 
 	def map_fields(self):
 		for field in self.meta.get_valid_columns():
@@ -280,13 +292,17 @@ class Opportunity(TransactionBase, CRMNote):
 			self.save()
 
 		else:
-			frappe.throw(_("Cannot declare as lost, because Quotation has been made."))
+			frappe.throw(_("Cannot declare as Lost because an active Quotation exists."))
 
 	def has_active_quotation(self):
 		if not self.get("items", []):
 			return frappe.get_all(
 				"Quotation",
-				{"opportunity": self.name, "status": ("not in", ["Lost", "Closed"]), "docstatus": 1},
+				{
+					"opportunity": self.name,
+					"status": ("not in", ["Lost", "Cancelled", "Expired"]),
+					"docstatus": 1,
+				},
 				"name",
 			)
 		else:
@@ -300,7 +316,7 @@ class Opportunity(TransactionBase, CRMNote):
 				.where(
 					(q.docstatus == 1)
 					& (qi.prevdoc_docname == self.name)
-					& q.status.notin(["Lost", "Closed"])
+					& q.status.notin(["Lost", "Cancelled", "Expired"])
 				)
 				.run()
 			)
@@ -308,7 +324,13 @@ class Opportunity(TransactionBase, CRMNote):
 	def has_ordered_quotation(self):
 		if not self.get("items", []):
 			return frappe.get_all(
-				"Quotation", {"opportunity": self.name, "status": "Ordered", "docstatus": 1}, "name"
+				"Quotation",
+				{
+					"opportunity": self.name,
+					"status": ("in", ["Ordered", "Partially Ordered"]),
+					"docstatus": 1,
+				},
+				"name",
 			)
 		else:
 			q = frappe.qb.DocType("Quotation")
@@ -318,7 +340,11 @@ class Opportunity(TransactionBase, CRMNote):
 				.inner_join(qi)
 				.on(q.name == qi.parent)
 				.select(q.name)
-				.where((q.docstatus == 1) & (qi.prevdoc_docname == self.name) & (q.status == "Ordered"))
+				.where(
+					(q.docstatus == 1)
+					& (qi.prevdoc_docname == self.name)
+					& (q.status.isin(["Ordered", "Partially Ordered"]))
+				)
 				.run()
 			)
 
@@ -330,6 +356,10 @@ class Opportunity(TransactionBase, CRMNote):
 			if self.has_active_quotation():
 				return False
 			return True
+
+	def validate_party(self) -> None:
+		if self.opportunity_from == "Customer":
+			validate_party_frozen_disabled(self.company, "Customer", self.party_name)
 
 	def validate_cust_name(self):
 		if self.party_name:
@@ -389,7 +419,7 @@ def get_item_details(item_code: str):
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_multiple_status(names: str | list[str], status: str):
 	names = frappe.parse_json(names)
 	for name in names:

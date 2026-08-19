@@ -9,9 +9,9 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.query_builder import Case
 from frappe.query_builder.functions import Max, Min, Sum
-from frappe.utils import cint, flt, nowdate, nowtime, parse_json
+from frappe.utils import cint, flt, get_datetime, now_datetime, nowdate, nowtime, parse_json
 
-from erpnext.stock.utils import get_or_make_bin, get_stock_balance
+from erpnext.stock.utils import get_combine_datetime, get_or_make_bin, get_stock_balance
 
 
 class StockReservationEntry(Document):
@@ -298,11 +298,13 @@ class StockReservationEntry(Document):
 
 			self.reservation_based_on = "Serial and Batch"
 			self.sb_entries.clear()
+
 			kwargs = frappe._dict(
 				{
 					"item_code": self.item_code,
 					"warehouse": self.warehouse,
 					"qty": abs(self.reserved_qty) or 0,
+					"posting_datetime": self.get_voucher_posting_datetime(),
 					"based_on": based_on
 					or frappe.get_single_value("Stock Settings", "pick_serial_and_batch_based_on"),
 				}
@@ -340,6 +342,37 @@ class StockReservationEntry(Document):
 							"warehouse": self.warehouse,
 						},
 					)
+
+	def get_voucher_posting_datetime(self):
+		reservation_datetime = now_datetime()
+		meta = frappe.get_meta(self.voucher_type)
+		if meta.has_field("posting_datetime"):
+			if posting_datetime := frappe.db.get_value(
+				self.voucher_type, self.voucher_no, "posting_datetime"
+			):
+				return min(get_datetime(posting_datetime), reservation_datetime)
+
+		for date_field, time_field in (
+			("posting_date", "posting_time"),
+			("transaction_date", "transaction_time"),
+		):
+			if not meta.has_field(date_field):
+				continue
+
+			fields = [date_field]
+			if meta.has_field(time_field):
+				fields.append(time_field)
+
+			values = frappe.db.get_value(self.voucher_type, self.voucher_no, fields, as_dict=True)
+			if not values or not values.get(date_field):
+				continue
+
+			posting_datetime = get_combine_datetime(
+				values.get(date_field), values.get(time_field) or "23:59:59.999999"
+			)
+			return min(posting_datetime, reservation_datetime)
+
+		return reservation_datetime
 
 	def validate_reservation_based_on_serial_and_batch(self) -> None:
 		"""Validates `Reserved Qty`, `Serial and Batch Nos` when `Reservation Based On` is `Serial and Batch`."""
@@ -716,10 +749,19 @@ def get_available_qty_to_reserve(
 			conditions &= sre.name != ignore_sre
 
 		# Lock the rows being aggregated so a concurrent reservation can't change them mid-transaction.
-		# MariaDB carries the lock on the aggregate query itself; postgres rejects FOR UPDATE with an
-		# aggregate, so on postgres lock the same rows in a separate plain SELECT first (held for the txn).
+		# MariaDB carries the lock on the aggregate query itself (its gap locks also serialize two
+		# FIRST reservations, when no SRE rows exist yet); postgres has no gap locks, so gate on the
+		# Bin row (exists once there is stock), then lock the matching SREs in a plain SELECT.
 		if frappe.db.db_type == "postgres":
-			frappe.qb.from_(sre).select(sre.name).where(conditions).for_update().run()
+			bin_table = frappe.qb.DocType("Bin")
+			(
+				frappe.qb.from_(bin_table)
+				.select(bin_table.name)
+				.where((bin_table.item_code == item_code) & (bin_table.warehouse == warehouse))
+				.for_update()
+				.run()
+			)
+			frappe.qb.from_(sre).select(sre.name).where(conditions).orderby(sre.name).for_update().run()
 
 		query = (
 			frappe.qb.from_(sre)
@@ -828,7 +870,9 @@ def get_sre_reserved_qty_for_items_and_warehouses(
 		.select(
 			sre.item_code,
 			sre.warehouse,
-			Sum(sre.reserved_qty - sre.delivered_qty).as_("reserved_qty"),
+			Sum(sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty).as_(
+				"reserved_qty"
+			),
 		)
 		.where(
 			(sre.docstatus == 1)
@@ -1082,7 +1126,7 @@ def get_ssb_bundle_for_voucher(sre_list) -> object:
 def has_reserved_stock(voucher_type: str, voucher_no: str, voucher_detail_no: str | None = None) -> bool:
 	"""Returns True if there is any Stock Reservation Entry for the given voucher."""
 
-	if get_stock_reservation_entries_for_voucher(
+	if _get_stock_reservation_entries_for_voucher(
 		voucher_type, voucher_no, voucher_detail_no, fields=["name"], ignore_status=True
 	):
 		return True
@@ -1190,7 +1234,7 @@ class StockReservation:
 
 			self.available_qty_to_reserve = self.get_available_qty_to_reserve(item_code, warehouse)
 			if not self.available_qty_to_reserve:
-				self.throw_stock_not_exists_error(item.idx, item_code, warehouse)
+				self.throw_stock_not_exists_error(item.get("idx"), item_code, warehouse)
 
 			self.qty_to_be_reserved = (
 				qty if self.available_qty_to_reserve >= qty else self.available_qty_to_reserve
@@ -1207,7 +1251,7 @@ class StockReservation:
 			sre.voucher_no = item.get("voucher_no") or self.doc.name
 			sre.voucher_detail_no = item.get(child_doctype) or item.name or item.get("voucher_detail_no")
 			sre.available_qty = self.available_qty_to_reserve
-			sre.voucher_qty = self.qty_to_be_reserved
+			sre.voucher_qty = qty
 			sre.reserved_qty = self.qty_to_be_reserved
 			sre.company = self.doc.company
 			sre.stock_uom = item_details.stock_uom
@@ -1250,13 +1294,16 @@ class StockReservation:
 			)
 
 	def throw_stock_not_exists_error(self, idx, item_code, warehouse):
-		frappe.msgprint(
-			_("Row #{0}: Stock not available to reserve for the Item {1} in Warehouse {2}.").format(
+		if idx:
+			msg = _("Row #{0}: Stock not available to reserve for the Item {1} in Warehouse {2}.").format(
 				idx, frappe.bold(item_code), frappe.bold(warehouse)
-			),
-			title=_("Stock Reservation"),
-			indicator="orange",
-		)
+			)
+		else:
+			msg = _("Stock not available to reserve for the Item {0} in Warehouse {1}.").format(
+				frappe.bold(item_code), frappe.bold(warehouse)
+			)
+
+		frappe.msgprint(msg, title=_("Stock Reservation"), indicator="orange")
 
 	def get_available_qty_to_reserve(self, item_code, warehouse, ignore_sre=None):
 		available_qty = get_stock_balance(item_code, warehouse)
@@ -1336,6 +1383,7 @@ class StockReservation:
 								"voucher_type": entry.voucher_type or to_doctype,
 								"voucher_no": entry.voucher_no,
 								"voucher_detail_no": entry.voucher_detail_no,
+								"stock_uom": entry.stock_uom,
 								"serial_nos": [],
 								"sre_names": defaultdict(float),
 								"batches": defaultdict(float),
@@ -1393,6 +1441,7 @@ class StockReservation:
 			sre.voucher_qty = entry.required_qty
 			sre.item_code = entry.item_code
 			sre.warehouse = entry.warehouse
+			sre.stock_uom = entry.stock_uom
 			sre.reserved_qty = min(sre.available_qty, entry.qty)
 			sre.has_serial_no = frappe.get_value("Item", sre.item_code, "has_serial_no")
 			sre.has_batch_no = frappe.get_value("Item", sre.item_code, "has_batch_no")
@@ -1817,7 +1866,7 @@ def cancel_stock_reservation_entries(
 		sre_list = {}
 
 		if voucher_type and voucher_no:
-			sre_list = get_stock_reservation_entries_for_voucher(
+			sre_list = _get_stock_reservation_entries_for_voucher(
 				voucher_type, voucher_no, voucher_detail_no, fields=["name"]
 			)
 		elif from_voucher_type and from_voucher_no:
@@ -1860,6 +1909,21 @@ def get_stock_reservation_entries_for_voucher(
 ) -> list[dict]:
 	"""Returns list of Stock Reservation Entries against a Voucher."""
 
+	return _get_stock_reservation_entries_for_voucher(
+		voucher_type, voucher_no, voucher_detail_no, fields, ignore_status, ignore_permissions=False
+	)
+
+
+def _get_stock_reservation_entries_for_voucher(
+	voucher_type: str,
+	voucher_no: str,
+	voucher_detail_no: str | None = None,
+	fields: list[str] | None = None,
+	ignore_status: bool = False,
+	ignore_permissions: bool = True,
+) -> list[dict]:
+	"""Returns list of Stock Reservation Entries against a Voucher."""
+
 	if not fields or not isinstance(fields, list):
 		fields = [
 			"name",
@@ -1873,13 +1937,10 @@ def get_stock_reservation_entries_for_voucher(
 
 	sre = frappe.qb.DocType("Stock Reservation Entry")
 	query = (
-		frappe.qb.from_(sre)
+		frappe.get_query(sre, fields=fields, ignore_permissions=ignore_permissions)
 		.where((sre.docstatus == 1) & (sre.voucher_type == voucher_type) & (sre.voucher_no == voucher_no))
 		.orderby(sre.creation)
 	)
-
-	for field in fields:
-		query = query.select(sre[field])
 
 	if voucher_detail_no:
 		query = query.where(sre.voucher_detail_no == voucher_detail_no)

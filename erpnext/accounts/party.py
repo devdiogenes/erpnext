@@ -140,6 +140,7 @@ def _get_party_details(
 	if not ignore_permissions:
 		ptype = "select" if frappe.only_has_select_perm(party_type) else "read"
 		frappe.has_permission(party_type, ptype, party, throw=True)
+		validate_party_company(party_type, party.name, company)
 
 	currency = party.get("default_currency") or currency or get_company_currency(company)
 
@@ -155,7 +156,7 @@ def _get_party_details(
 		dispatch_address,
 		ignore_permissions=ignore_permissions,
 	)
-	set_contact_details(party_details, party, party_type)
+	set_contact_details(party_details, party, party_type, doctype)
 	set_other_values(party_details, party, party_type)
 	set_price_list(party_details, party, party_type, price_list, pos_profile)
 
@@ -195,6 +196,17 @@ def _get_party_details(
 		party_details["tax_category"] = frappe.get_value("POS Profile", pos_profile, "tax_category")
 
 	return party_details
+
+
+def validate_party_company(party_type, party, company):
+	if not company or party_type not in ("Customer", "Supplier"):
+		return
+
+	from erpnext.stock.doctype.company_restriction.company_restriction import (
+		validate_masters_for_company,
+	)
+
+	validate_masters_for_company(party_type, [party], company)
 
 
 def set_address_details(
@@ -346,9 +358,21 @@ def complete_contact_details(party_details):
 	party_details.update(contact_details)
 
 
-def set_contact_details(party_details, party, party_type):
+def set_contact_details(party_details, party, party_type, doctype=None):
 	party_details.contact_person = get_default_contact(party_type, party.name)
 	complete_contact_details(party_details)
+
+	# the shipping contact is picked by the user, so it has no default to fall back on;
+	# blank it instead of carrying the previous party's contact over
+	if doctype and frappe.get_meta(doctype).has_field("shipping_contact_person"):
+		party_details.update(
+			{
+				"shipping_contact_person": None,
+				"shipping_contact_display": None,
+				"shipping_contact_mobile": None,
+				"shipping_contact_email": None,
+			}
+		)
 
 
 def set_other_values(party_details, party, party_type):
@@ -430,6 +454,17 @@ def get_party_account(
 	Will first search in party (Customer / Supplier) record, if not found,
 	will search in group (Customer Group / Supplier Group),
 	finally will return default."""
+
+	def account_perm_check(account):
+		ptype = "select" if frappe.only_has_select_perm("Account") else "read"
+		if frappe.has_permission("Account", ptype, account):
+			return
+
+		# Using custom message to prevent data leak in case of `apply_strict_permission` is enabled.
+		frappe.throw(
+			_("User don't have permissions to select/read this account."), exc=frappe.PermissionError
+		)
+
 	if not party_type:
 		frappe.throw(_("Party Type is mandatory"))
 	if not company:
@@ -440,46 +475,51 @@ def get_party_account(
 			"default_receivable_account" if party_type == "Customer" else "default_payable_account"
 		)
 
-		return frappe.get_cached_value("Company", company, default_account_name)
-
-	account = frappe.db.get_value(
-		"Party Account", {"parenttype": party_type, "parent": party, "company": company}, "account"
-	)
-
-	if not account and party_type in ["Customer", "Supplier"]:
-		party_group_doctype = "Customer Group" if party_type == "Customer" else "Supplier Group"
-		group = frappe.get_cached_value(party_type, party, scrub(party_group_doctype))
+		account = frappe.get_cached_value("Company", company, default_account_name)
+	else:
 		account = frappe.db.get_value(
-			"Party Account",
-			{"parenttype": party_group_doctype, "parent": group, "company": company},
-			"account",
+			"Party Account", {"parenttype": party_type, "parent": party, "company": company}, "account"
 		)
 
-	if not account and party_type in ["Customer", "Supplier"]:
-		default_account_name = (
-			"default_receivable_account" if party_type == "Customer" else "default_payable_account"
-		)
-		account = frappe.get_cached_value("Company", company, default_account_name)
+		if not account and party_type in ["Customer", "Supplier"]:
+			party_group_doctype = "Customer Group" if party_type == "Customer" else "Supplier Group"
+			group = frappe.get_cached_value(party_type, party, scrub(party_group_doctype))
+			account = frappe.db.get_value(
+				"Party Account",
+				{"parenttype": party_group_doctype, "parent": group, "company": company},
+				"account",
+			)
 
-	existing_gle_currency = get_party_gle_currency(party_type, party, company)
-	if existing_gle_currency:
-		if account:
-			account_currency = frappe.get_cached_value("Account", account, "account_currency")
-		if (account and account_currency != existing_gle_currency) or not account:
-			account = get_party_gle_account(party_type, party, company)
+		if not account and party_type in ["Customer", "Supplier"]:
+			default_account_name = (
+				"default_receivable_account" if party_type == "Customer" else "default_payable_account"
+			)
+			account = frappe.get_cached_value("Company", company, default_account_name)
 
-	# get default account on the basis of party type
-	if not account:
-		account_type = frappe.get_cached_value("Party Type", party_type, "account_type")
-		default_account_name = "default_" + account_type.lower() + "_account"
-		account = frappe.get_cached_value("Company", company, default_account_name)
+		existing_gle_currency = get_party_gle_currency(party_type, party, company)
+		if existing_gle_currency:
+			if account:
+				account_currency = frappe.get_cached_value("Account", account, "account_currency")
+			if (account and account_currency != existing_gle_currency) or not account:
+				account = get_party_gle_account(party_type, party, company)
 
-	if include_advance and party_type in ["Customer", "Supplier", "Student"]:
+		# get default account on the basis of party type
+		if not account:
+			account_type = frappe.get_cached_value("Party Type", party_type, "account_type")
+			default_account_name = "default_" + account_type.lower() + "_account"
+			account = frappe.get_cached_value("Company", company, default_account_name)
+
+	if account:
+		account_perm_check(account)
+
+	if include_advance and party and party_type in ["Customer", "Supplier", "Student"]:
 		advance_account = get_party_advance_account(party_type, party, company)
+
 		if advance_account:
+			account_perm_check(advance_account)
 			return [account, advance_account]
-		else:
-			return [account]
+
+		return [account]
 
 	return account
 
@@ -849,11 +889,13 @@ def validate_account_party_type(self):
 
 
 def get_dashboard_info(party_type, party, loyalty_program=None):
+	doctype = "Sales Invoice" if party_type == "Customer" else "Purchase Invoice"
+	if not frappe.has_permission(doctype, "read"):
+		return None
+
 	current_fiscal_year = get_fiscal_year(nowdate(), as_dict=True)
 
-	doctype = "Sales Invoice" if party_type == "Customer" else "Purchase Invoice"
-
-	companies = frappe.get_all(
+	companies = frappe.get_list(
 		doctype, filters={"docstatus": 1, party_type.lower(): party}, distinct=1, fields=["company"]
 	)
 
