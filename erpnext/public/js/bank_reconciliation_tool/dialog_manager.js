@@ -89,7 +89,16 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 					const proposals_wrapper = this.dialog.fields_dict.payment_proposals.$wrapper;
 					proposals_wrapper.show();
 					this.dialog.fields_dict.no_matching_vouchers.$wrapper.hide();
-					this.data = data.map((row) => this.format_row(row));
+					const rows = data.map((row) => {
+						const reference_date = row["reference_date"] || row["posting_date"];
+						const exact_match =
+							reference_date === this.bank_transaction.date &&
+							row["paid_amount"] === this.bank_transaction.unallocated_amount;
+						return { exact_match, row };
+					});
+					rows.sort((a, b) => (b.exact_match ? 1 : 0) - (a.exact_match ? 1 : 0));
+					this.data = rows.map((r) => this.format_row(r.row));
+					this._voucher_exact_match = rows.map((r) => r.exact_match);
 					this.get_dt_columns();
 					this.get_datatable(proposals_wrapper);
 				} else {
@@ -121,12 +130,24 @@ erpnext.accounts.bank_reconciliation.DialogManager = class DialogManager {
 				name: __("Reference Date"),
 				editable: false,
 				width: 120,
-				format: frappe.form.formatters.Date,
+				format: (value, row) => {
+					const idx = cint(row[1].content) - 1;
+					const formatted = frappe.form.formatters.Date(value);
+					return this._voucher_exact_match?.[idx]
+						? `<span style="color:var(--green-500)">${formatted}</span>`
+						: formatted;
+				},
 			},
 			{
 				name: __("Remaining"),
 				editable: false,
 				width: 100,
+				format: (value, row) => {
+					const idx = cint(row[1].content) - 1;
+					return this._voucher_exact_match?.[idx]
+						? `<span style="color:var(--green-500)">${value}</span>`
+						: value;
+				},
 			},
 			{
 				name: __("Reference Number"),
